@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Review">
+<meta name="color-scheme" content="light dark">
+<title>Review queue</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<header id="bar">
+  <div class="row">
+    <button id="back" hidden>&lsaquo; Queue</button>
+    <h1 id="title">Review queue</h1>
+    <span id="status" aria-live="polite"></span>
+    <button id="addBtn" hidden title="Add a PDF from this device to the queue">Add PDF</button>
+    <input type="file" id="addFile" accept="application/pdf,.pdf" hidden>
+    <button id="refresh" title="Reload the queue">Refresh</button>
+    <button id="doneBtn" class="primary" hidden>Done</button>
+  </div>
+  <div class="row tools" id="tools" hidden>
+    <span class="seg" role="group" aria-label="Tool">
+      <button data-tool="select" class="on">Select</button>
+      <button data-tool="change">Change pen</button>
+      <button data-tool="discuss">Discuss pen</button>
+    </span>
+    <label class="check"><input type="checkbox" id="finger"> Finger draws</label>
+    <span class="spacer"></span>
+    <button id="listBtn">List</button>
+  </div>
+</header>
+
+<main id="queue"></main>
+
+<main id="viewer" hidden>
+  <div id="brief" hidden></div>
+  <div id="pages"></div>
+</main>
+
+<div id="selbar" class="floating" hidden>
+  <span>Mark selection</span>
+  <button data-mark="change" class="change">Change</button>
+  <button data-mark="discuss" class="discuss">Discuss</button>
+</div>
+
+<div id="lastbar" class="floating" hidden>
+  <span id="lastText"></span>
+  <button id="lastNote">Add note</button>
+  <button id="lastRec">&#9679; Record</button>
+  <button id="lastUndo">Undo</button>
+</div>
+
+<section id="sheet" hidden aria-label="Highlight">
+  <div class="row">
+    <b id="sheetNum"></b>
+    <span id="sheetPage" class="muted"></span>
+    <span class="seg" role="group" aria-label="Tag">
+      <button data-settag="change">Change</button>
+      <button data-settag="discuss">Discuss</button>
+    </span>
+    <button id="recBtn" title="Record a voice note for this highlight">&#9679; Record</button>
+    <span class="spacer"></span>
+    <button id="sheetDelete" class="danger">Delete</button>
+    <button id="sheetClose" class="primary">Close</button>
+  </div>
+  <blockquote id="sheetQuote"></blockquote>
+  <textarea id="sheetNote" rows="3" placeholder="Note (optional). Tap the microphone on the keyboard to dictate."></textarea>
+  <div id="clips"></div>
+</section>
+
+<aside id="list" hidden aria-label="Highlights"></aside>
+
+<section id="addPanel" hidden aria-label="Add a PDF">
+  <h2>Add to the queue</h2>
+  <p id="addName" class="muted"></p>
+  <label>Title <input type="text" id="addTitle" autocomplete="off"></label>
+  <label>Note (optional) <textarea id="addNote" rows="3" placeholder="What to look at"></textarea></label>
+  <div class="row">
+    <span class="spacer"></span>
+    <button id="addCancel">Cancel</button>
+    <button id="addGo" class="primary">Add to queue</button>
+  </div>
+</section>
+
+<div id="toast" hidden></div>
+
+<script src="/static/pdfjs/pdf.min.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>
