@@ -58,7 +58,7 @@ window.reviewVim = (function () {
   Vim.defineMotion('screenLine', function (cm, head, args, vim, inputState) {
     if (inputState.operator && args.linewise) return this.moveByLines(cm, head, args, vim, inputState);
     // Keep the column between j and k, and after $ stay at the ends of the rows.
-    if (vim.lastMotion === this.moveToEol) vim.screenEnd = true;
+    if (vim.lastMotion === this.screenRowEnd) vim.screenEnd = true;
     else if (vim.lastMotion !== this.screenLine) vim.screenEnd = false;
     if (vim.lastMotion !== this.screenLine || vim.lastMotion === null) vim.screenGoal = cm.charCoords(head, 'div').left;
     const goal = vim.screenEnd ? 1e6 : vim.screenGoal;
@@ -73,6 +73,47 @@ window.reviewVim = (function () {
   Vim.mapCommand('gk', 'motion', 'screenLine', { forward: false });
   Vim.mapCommand('j', 'motion', 'screenLine', { forward: true, linewise: true });
   Vim.mapCommand('k', 'motion', 'screenLine', { forward: false, linewise: true });
+
+  // $ 0 and ^ go to the ends of the row on screen too, as g$ g0 and g^ do. With an operator (d$, D, C, c0) they still
+  // mean the whole line, as dj does; so does a visual block, whose $ reaches the end of every line. A and I still go to
+  // the ends of the whole line, and g_ to its last character that is not a space.
+  function rowEnds(cm, pos) {
+    const y = rowTop(cm, pos) + 2, end = cm.coordsChar({ left: 1e6, top: y }, 'div');
+    let last = end.ch;
+    while (last > 0 && rowTop(cm, new Pos(pos.line, last)) > y) last--;
+    return { first: cm.coordsChar({ left: 0, top: y }, 'div').ch, last };
+  }
+  const wholeLine = (args, vim, inputState) => (inputState.operator && !args.screen) || vim.visualBlock;
+  Vim.defineMotion('screenRowEnd', function (cm, head, args, vim, inputState) {
+    if (wholeLine(args, vim, inputState)) return this.moveToEol(cm, head, args, vim, inputState);
+    let cur = head;
+    for (let i = 1; i < (args.repeat || 1); i++) {
+      const next = oneRow(cm, cur, 1e6, true);
+      if (next === cur) return null;
+      cur = next;
+    }
+    vim.lastHPos = Infinity;
+    const last = rowEnds(cm, cur).last;
+    args.reachedLineEnd = !args.screen && last >= lineLen(cm, cur.line) - 1;     // v$ there takes the line break, as in Vim
+    return new Pos(cur.line, last);
+  });
+  Vim.defineMotion('screenRowStart', function (cm, head, args, vim, inputState) {
+    if (wholeLine(args, vim, inputState)) return this.moveToStartOfLine(cm, head, args, vim, inputState);
+    return new Pos(head.line, rowEnds(cm, head).first);
+  });
+  Vim.defineMotion('screenRowText', function (cm, head, args, vim, inputState) {
+    if (wholeLine(args, vim, inputState)) return this.moveToFirstNonWhiteSpaceCharacter(cm, head, args, vim, inputState);
+    const { first, last } = rowEnds(cm, head), text = cm.getLine(head.line);
+    let ch = first;
+    while (ch < last && /\s/.test(text.charAt(ch))) ch++;
+    return new Pos(head.line, ch);
+  });
+  Vim.mapCommand('$', 'motion', 'screenRowEnd', { inclusive: true });
+  Vim.mapCommand('0', 'motion', 'screenRowStart', {});
+  Vim.mapCommand('^', 'motion', 'screenRowText', {});
+  Vim.mapCommand('g$', 'motion', 'screenRowEnd', { inclusive: true, screen: true });
+  Vim.mapCommand('g0', 'motion', 'screenRowStart', { screen: true });
+  Vim.mapCommand('g^', 'motion', 'screenRowText', { screen: true });
 
   // + - _ and Enter are linewise, which the keymap leaves out.
   Vim.mapCommand('+', 'motion', 'moveByLines', { forward: true, toFirstChar: true, linewise: true });
@@ -446,7 +487,7 @@ window.reviewVim = (function () {
   // keys that move: if a key release were ever lost, these would just stop at the end of the file, where a repeating
   // x would keep deleting.
   const HOLD_KEYS = 'hjklwbeWBE{}';
-  const HOLD_WAIT = 280, HOLD_EVERY = 30;
+  const HOLD_WAIT = 350, HOLD_EVERY = 80;    // about 12 moves a second: slow enough to stop where you mean to
   let holdTimer = null, holdKey = null;
   function stopHold() { clearTimeout(holdTimer); clearInterval(holdTimer); holdTimer = null; holdKey = null; }
   document.addEventListener('keydown', e => {

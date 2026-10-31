@@ -276,7 +276,7 @@
     nodes: new Map(),  // figures already built, kept so they need not load again
     addRef: null,
   };
-  const CM = '/static/codemirror/', CM_VERSION = '?v=4';   // these files are cached; raise this when they change
+  const CM = '/static/codemirror/', CM_VERSION = '?v=5';   // these files are cached; raise this when they change
   const pref = {
     get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
     set(k, v) { try { localStorage.setItem(k, v); } catch (e) { /* not remembered */ } },
@@ -345,15 +345,17 @@
     T.cm.on('vim-mode-change', e => showVimMode(e.mode + (e.subMode ? ' ' + e.subMode : '')));
     showVimMode('normal');
     refreshChanges(); refreshImages(); updateWords();
-    T.cm.on('cursorActivity', () => { clearTimeout(PV.syncTimer); PV.syncTimer = setTimeout(syncPreview, 80); });
     PV.figures = new Map();
     $('#previewBtn').hidden = !isMarkdown();
     setPreview(isMarkdown() && pref.get('review.preview') === '1');
     setStatus(t.edited ? 'Saved' : '');
     if (!S.reopen && window.matchMedia('(pointer: fine)').matches) T.cm.focus();
+    restorePlace();
+    T.cm.on('cursorActivity', notePlace);
   }
 
   function closeText() {
+    keepPlace();
     if (window.reviewVim) window.reviewVim.detach();
     setPreview(false);
     $('#previewBtn').hidden = true;
@@ -406,6 +408,40 @@
     return out.join('');
   }
 
+  // Where the reader was, per item in this browser: the cursor, and how far down the window it sat.
+  const placeKey = () => 'review.place.' + S.item.id;
+  function keepPlace() {
+    clearTimeout(T.placeTimer);
+    if (!T.cm || !S.item || T.placing) return;
+    const u = T.cm.getCursor(), y = T.cm.charCoords(u, 'window').top;
+    try { localStorage.setItem(placeKey(), JSON.stringify({ line: u.line, ch: u.ch, y: Math.round(y) })); } catch (e) { /* not kept */ }
+  }
+  function notePlace() {
+    clearTimeout(T.placeTimer);
+    T.placeTimer = setTimeout(keepPlace, 300);
+  }
+  // Figures load after this and push the text down, so stay on the place until they settle or the reader moves.
+  function restorePlace() {
+    let d = null;
+    try { d = JSON.parse(localStorage.getItem(placeKey())); } catch (e) { /* none */ }
+    if (!d || !Number.isFinite(d.line) || !Number.isFinite(d.ch) || !Number.isFinite(d.y)) return;
+    const cm = T.cm, at = cm.clipPos({ line: d.line, ch: d.ch });
+    T.placing = true;
+    cm.setCursor(at);
+    const go = () => { if (T.cm === cm) window.scrollTo(window.scrollX, cm.charCoords(at, 'page').top - d.y); };
+    go();
+    const seen = window.ResizeObserver ? new ResizeObserver(go) : null;
+    if (seen) seen.observe(cm.getWrapperElement());
+    const stop = () => {
+      if (seen) seen.disconnect();
+      clearTimeout(timer);
+      ['keydown', 'wheel', 'pointerdown', 'touchstart'].forEach(k => window.removeEventListener(k, stop, true));
+      T.placing = false;
+    };
+    const timer = setTimeout(stop, 5000);
+    ['keydown', 'wheel', 'pointerdown', 'touchstart'].forEach(k => window.addEventListener(k, stop, true));
+  }
+
   // A copy of unsaved text in this browser, in case the page closes before it reaches the server.
   const draftKey = () => 'review.draft.' + S.item.id;
   function keepDraft() {
@@ -433,7 +469,9 @@
     }
     return false;
   }
+  window.addEventListener('scroll', () => { if (T.cm) notePlace(); }, { passive: true });
   window.addEventListener('beforeunload', e => {
+    keepPlace();
     if (T.cm && (T.dirty || T.saving || T.conflict)) { keepDraft(); e.preventDefault(); e.returnValue = ''; }
   });
 
@@ -447,7 +485,7 @@
     if (!T.typingSince) T.typingSince = now;
     T.timer = setTimeout(saveText, now - T.typingSince > 4000 ? 0 : 600);
     clearTimeout(T.refreshTimer);
-    T.refreshTimer = setTimeout(() => { if (T.cm) { keepDraft(); refreshChanges(); refreshImages(); updateWords(); renderPreview(); } }, 250);
+    T.refreshTimer = setTimeout(() => { if (T.cm) { keepDraft(); refreshChanges(); refreshImages(); updateWords(); renderPreview(true); } }, 250);
   }
 
   function updateWords() {
@@ -677,7 +715,7 @@
         img.alt = x.alt; img.src = src;
         img.addEventListener('load', () => {
           if (fig.widget) fig.widget.changed();
-          if (T.cm && window.reviewVim) window.reviewVim.keepCursorInView(T.cm);
+          if (T.cm && !T.placing && window.reviewVim) window.reviewVim.keepCursorInView(T.cm);
         });
         a.appendChild(img);
       }
@@ -698,7 +736,7 @@
       await page.render({ canvasContext: canvas.getContext('2d'), viewport: vp }).promise;
       pdf.destroy();
       if (fig.widget) fig.widget.changed();
-      if (T.cm && window.reviewVim) window.reviewVim.keepCursorInView(T.cm);
+      if (T.cm && !T.placing && window.reviewVim) window.reviewVim.keepCursorInView(T.cm);
     } catch (e) {
       $('figcaption', fig).textContent += ' (could not draw this PDF: ' + e.message + ')';
     }
@@ -784,7 +822,7 @@
   // The Markdown is rendered in the browser whenever typing pauses, a top-level block at a time, so each block knows
   // its source lines. Changed text is marked by private-use characters put into the source before rendering, and
   // those become <mark> afterwards. Raw HTML from the file is shown as text, never run.
-  const PV = { on: false, blocks: [], figures: new Map(), syncTimer: null, ready: false };
+  const PV = { on: false, blocks: [], figures: new Map(), ready: false, driver: 'editor', sizes: '', expectPage: null, expectBox: null, observer: null, body: null };
   const MARK_START = '', MARK_END = '', MARK_GONE = '';
   const noMarks = s => String(s || '').replace(/[-]|%EE%80%9[0-2]/gi, '');
   const isMarkdown = () => !!S.item && /\.(md|markdown)$/i.test(S.item.file || '');
@@ -853,7 +891,7 @@
       return text;
     }).join('\n');
   }
-  function renderPreview() {
+  function renderPreview(edited) {
     if (!PV.on || !T.cm) return;
     setUpMarked();
     const box = $('#preview'), top = box.scrollTop;
@@ -868,8 +906,8 @@
       }
       line += count;
     }
-    box.innerHTML = html.split(MARK_START).join('<mark class="pv-new">').split(MARK_END).join('</mark>')
-      .split(MARK_GONE).join('<span class="pv-gone"></span>');
+    box.innerHTML = '<div class="pv-body">' + html.split(MARK_START).join('<mark class="pv-new">').split(MARK_END).join('</mark>')
+      .split(MARK_GONE).join('<span class="pv-gone"></span>') + '</div>';
     const seen = {};
     $$('.pv-fig', box).forEach(el => {
       const ref = el.dataset.ref, alt = el.dataset.alt;
@@ -879,11 +917,13 @@
       el.replaceWith(PV.figures.get(key));
     });
     box.scrollTop = top;
-    syncPreview();
+    watchPanes();
+    if (edited) PV.driver = 'editor';
+    alignPanes(PV.driver);
+    if (edited) showEdit();
   }
-  // Keep the block with the cursor in view.
-  function syncPreview() {
-    if (!PV.on || !T.cm) return;
+  // Keep the block being edited in view.
+  function showEdit() {
     const line = T.cm.getCursor().line, box = $('#preview');
     const blocks = $$('.pv-block', box);
     let found = null;
@@ -894,6 +934,92 @@
     if (!found) return;
     const r = found.getBoundingClientRect(), b = box.getBoundingClientRect(), pad = 90;
     if (r.top < b.top + pad || r.top > b.bottom - pad * 2) box.scrollTop += r.top - b.top - pad - 30;
+    PV.expectBox = box.scrollTop;
+  }
+
+  // The two panes scroll together. Each block knows its lines, so a height in the editor's page can be matched to a
+  // height in the preview, in straight lines between block edges, whichever side a figure or a long line makes taller.
+  function scrollAnchors() {
+    const box = $('#preview'), out = [[0, 0]];
+    const add = (e, p) => { const last = out[out.length - 1]; if (e > last[0] && p > last[1]) out.push([e, p]); };
+    for (const b of $$('.pv-block', box)) {
+      add(T.cm.heightAtLine(Number(b.dataset.from), 'page'), b.offsetTop);
+      add(T.cm.heightAtLine(Number(b.dataset.to) + 1, 'page'), b.offsetTop + b.offsetHeight);
+    }
+    add(document.documentElement.scrollHeight, box.scrollHeight);
+    return out;
+  }
+  function across(y, a, from, to) {
+    if (a.length < 2) return 0;
+    let i = 1;
+    while (i < a.length - 1 && a[i][from] < y) i++;
+    const p = a[i - 1], q = a[i], t = (y - p[from]) / (q[from] - p[from]);
+    return p[to] + Math.min(1, Math.max(0, t)) * (q[to] - p[to]);
+  }
+  // The panes are level at a reading line partway down the window. That line runs up to the very top as a pane reaches
+  // its top, and down to the very bottom as it reaches its end, so both panes get to both ends together.
+  const READING_LINE = 0.4;
+  function readingLine(s, most, height) {
+    const r = READING_LINE * height, head = Math.min(r, most / 2), tail = Math.min(height - r, most / 2);
+    if (s < head) return s + s / head * r;
+    if (s > most - tail) return s + r + (s - most + tail) / tail * (height - r);
+    return s + r;
+  }
+  function scrollForLine(y, most, height) {
+    if (most <= 0) return 0;
+    const r = READING_LINE * height, head = Math.min(r, most / 2), tail = Math.min(height - r, most / 2);
+    if (y < head + r) return y / (1 + r / head);
+    if (y > most - tail + r) return most - tail + (y - most + tail - r) / (1 + (height - r) / tail);
+    return y - r;
+  }
+  function alignPanes(driver) {
+    if (!PV.on || !T.cm) return;
+    const box = $('#preview'), a = scrollAnchors();
+    const pageH = window.innerHeight, pageMost = document.documentElement.scrollHeight - pageH;
+    const boxH = box.clientHeight, boxMost = box.scrollHeight - boxH;
+    if (driver === 'preview') {
+      const y = across(readingLine(box.scrollTop, boxMost, boxH), a, 1, 0);
+      window.scrollTo(window.scrollX, scrollForLine(y, pageMost, pageH));
+      PV.expectPage = window.scrollY;
+    } else {
+      const y = across(readingLine(window.scrollY, pageMost, pageH), a, 0, 1);
+      box.scrollTop = scrollForLine(y, boxMost, boxH);
+      PV.expectBox = box.scrollTop;
+    }
+  }
+  // A pane moved by the other one fires a scroll event too; those are not the reader's, and are not followed.
+  const atExpected = (now, expected) => expected !== null && Math.abs(now - expected) < 1.5;
+  window.addEventListener('scroll', () => {
+    if (!PV.on) return;
+    if (atExpected(window.scrollY, PV.expectPage)) { PV.expectPage = null; return; }
+    PV.driver = 'editor';
+    alignPanes('editor');
+  }, { passive: true });
+  $('#preview').addEventListener('scroll', () => {
+    if (!PV.on) return;
+    if (atExpected($('#preview').scrollTop, PV.expectBox)) { PV.expectBox = null; return; }
+    PV.driver = 'preview';
+    alignPanes('preview');
+  }, { passive: true });
+  // Figures that finish loading, and a window that rewraps the text, move everything below them.
+  const paneSizes = () => {
+    const w = T.cm.getWrapperElement();
+    return [w.offsetWidth, w.offsetHeight, PV.body ? PV.body.offsetWidth : 0, PV.body ? PV.body.offsetHeight : 0].join();
+  };
+  function watchPanes() {
+    if (!window.ResizeObserver) return;
+    if (!PV.observer) {
+      PV.observer = new ResizeObserver(() => {
+        if (!PV.on || !T.cm || paneSizes() === PV.sizes) return;
+        PV.sizes = paneSizes();
+        alignPanes(PV.driver);
+      });
+      PV.observer.observe(T.cm.getWrapperElement());
+    }
+    if (PV.body) PV.observer.unobserve(PV.body);
+    PV.body = $('#preview .pv-body');
+    PV.observer.observe(PV.body);
+    PV.sizes = paneSizes();
   }
   function setPreview(on) {
     PV.on = !!on;
@@ -902,9 +1028,13 @@
     box.hidden = !PV.on;
     btn.classList.toggle('on', PV.on);
     btn.setAttribute('aria-pressed', String(PV.on));
-    if (!PV.on) { box.innerHTML = ''; }
+    if (!PV.on) {
+      box.innerHTML = '';
+      if (PV.observer) PV.observer.disconnect();
+      PV.observer = PV.body = null;
+    }
     if (T.cm) T.cm.refresh();
-    if (PV.on) renderPreview();
+    if (PV.on) { PV.driver = 'editor'; renderPreview(); }
   }
   $('#previewBtn').addEventListener('click', () => {
     setPreview(!PV.on);

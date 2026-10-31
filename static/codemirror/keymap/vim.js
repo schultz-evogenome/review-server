@@ -1652,7 +1652,7 @@ function initVim$1(CodeMirror) {
             newAnchor = newAnchor || oldAnchor;
             sel.anchor = newAnchor;
             sel.head = newHead;
-            sel.toLineBreak = motion == 'moveToEol' && !vim.visualBlock && !vim.visualLine;  // review-server: v$ takes the line break too
+            sel.toLineBreak = (motion == 'moveToEol' || motionArgs.reachedLineEnd) && !vim.visualBlock && !vim.visualLine;  // review-server: v$ takes the line break too
             updateCmSelection(cm);
             updateMark(cm, vim, '<',
                 cursorIsBefore(newAnchor, newHead) ? newAnchor
