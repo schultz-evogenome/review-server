@@ -35,28 +35,41 @@ window.reviewVim = (function () {
 
   // ------------------------------------------------------------ motions
 
-  // j and k move by the lines on screen, as gj and gk do, since text here wraps. With an operator (dj, yk) they
-  // still mean whole lines. An image under a line takes up room that gj alone would get stuck in.
-  Vim.defineMotion('screenLine', function (cm, head, args, vim, inputState) {
-    if (inputState.operator) return this.moveByLines(cm, head, args, vim, inputState);
-    const keep = vim.lastMotion === this.screenLine;
-    let cur = head;
-    for (let i = 0; i < (args.repeat || 1); i++) {
-      if (keep || i) vim.lastMotion = this.moveByDisplayLines;
-      const next = this.moveByDisplayLines(cm, cur, { forward: args.forward, repeat: 1 }, vim);
-      const stuck = cm.charCoords(next, 'div').top === cm.charCoords(cur, 'div').top;
-      if (stuck && args.forward && cur.line < cm.lastLine()) {
-        cur = cm.coordsChar({ left: vim.lastHSPos, top: cm.heightAtLine(cur.line + 1, 'div') + 2 }, 'div');
-      } else if (stuck && !args.forward && cur.line > cm.firstLine()) {
-        const above = cm.charCoords(new Pos(cur.line - 1, lineLen(cm, cur.line - 1)), 'div');
-        cur = cm.coordsChar({ left: vim.lastHSPos, top: above.top + 2 }, 'div');
-      } else {
-        cur = next;
-      }
-      vim.lastHPos = cur.ch;
+  // j and k move by the lines on screen, since text here wraps. With an operator (dj, yk) they still mean whole lines.
+  // This goes one screen row at a time from measured positions: the keymap's gj treats a row shorter than the column
+  // as if it were not there, and an image under a line takes up room it can get stuck in.
+  const rowTop = (cm, pos) => cm.charCoords(pos, 'div').top;
+  function oneRow(cm, cur, goal, forward) {
+    const top = rowTop(cm, cur);
+    let line = cur.line, y;
+    if (Math.abs(top - rowTop(cm, new Pos(line, forward ? lineLen(cm, line) : 0))) < 2) {
+      if (forward ? line >= cm.lastLine() : line <= cm.firstLine()) return cur;
+      line += forward ? 1 : -1;
+      y = rowTop(cm, new Pos(line, forward ? 0 : lineLen(cm, line))) + 2;
+    } else {
+      y = forward ? cm.charCoords(cur, 'div').bottom + 2 : top - 2;
     }
+    const to = cm.coordsChar({ left: goal, top: y }, 'div');
+    // A goal past the end of the row gives the start of the next row: stay on this one, on its last character.
+    let ch = to.ch;
+    while (ch > 0 && rowTop(cm, new Pos(to.line, ch)) > y) ch--;
+    return new Pos(to.line, ch);
+  }
+  Vim.defineMotion('screenLine', function (cm, head, args, vim, inputState) {
+    if (inputState.operator && args.linewise) return this.moveByLines(cm, head, args, vim, inputState);
+    // Keep the column between j and k, and after $ stay at the ends of the rows.
+    if (vim.lastMotion === this.moveToEol) vim.screenEnd = true;
+    else if (vim.lastMotion !== this.screenLine) vim.screenEnd = false;
+    if (vim.lastMotion !== this.screenLine || vim.lastMotion === null) vim.screenGoal = cm.charCoords(head, 'div').left;
+    const goal = vim.screenEnd ? 1e6 : vim.screenGoal;
+    let cur = head;
+    for (let i = 0; i < (args.repeat || 1); i++) cur = oneRow(cm, cur, goal, args.forward);
+    vim.lastHPos = vim.screenEnd ? Infinity : cur.ch;
+    vim.lastHSPos = goal;
     return cur;
   });
+  Vim.mapCommand('gj', 'motion', 'screenLine', { forward: true });
+  Vim.mapCommand('gk', 'motion', 'screenLine', { forward: false });
   Vim.mapCommand('j', 'motion', 'screenLine', { forward: true, linewise: true });
   Vim.mapCommand('k', 'motion', 'screenLine', { forward: false, linewise: true });
 
@@ -107,10 +120,31 @@ window.reviewVim = (function () {
     const bar = document.querySelector('#bar');
     return bar ? Math.max(0, bar.getBoundingClientRect().bottom) : 0;
   };
+  // The part of the window the cursor should stay in: below the toolbar, even while the toolbar is slid away.
+  const visibleTop = cm => {
+    const bar = document.querySelector('#bar');
+    return (bar ? bar.offsetHeight : 0) + lineHeight(cm);
+  };
+  const visibleBottom = cm => window.innerHeight - 2 * lineHeight(cm);
+  function keepCursorInView(cm) {
+    const r = cm.cursorCoords(null, 'window'), top = visibleTop(cm), bottom = visibleBottom(cm);
+    // On the first row, show the top of the page, with any note above the text.
+    if (Math.abs(rowTop(cm, cm.getCursor()) - rowTop(cm, new Pos(cm.firstLine(), 0))) < 2) window.scrollTo(0, 0);
+    else if (r.top < top) window.scrollBy(0, r.top - top);
+    else if (r.bottom > bottom) window.scrollBy(0, r.bottom - bottom);
+  }
   function moveByPixels(cm, head, px, forward) {
-    const at = cm.charCoords(head, 'local'), sign = forward ? 1 : -1;
-    window.scrollBy(0, sign * px);
-    return cm.coordsChar({ left: at.left, top: at.top + sign * px + lineHeight(cm) / 2 }, 'local');
+    const at = cm.charCoords(head, 'local'), lh = lineHeight(cm), sign = forward ? 1 : -1;
+    const y = at.top + sign * px + lh / 2;
+    let to = cm.coordsChar({ left: at.left, top: y }, 'local');
+    // Landing inside an image gives the line above it: go on to the text past the image.
+    if (forward && cm.charCoords(to, 'local').bottom < y - lh && to.line < cm.lastLine()) {
+      to = new Pos(to.line + 1, 0);
+    } else if (!forward && to.line === head.line && Math.abs(cm.charCoords(to, 'local').top - at.top) < 2 && head.line > cm.firstLine()) {
+      to = new Pos(head.line - 1, lineLen(cm, head.line - 1));
+    }
+    window.scrollBy(0, cm.charCoords(to, 'local').top - at.top);
+    return to;
   }
   Vim.defineMotion('moveByScroll', (cm, head, args) => {
     const px = args.repeatIsExplicit && args.repeat ? args.repeat * lineHeight(cm) : window.innerHeight / 2;
@@ -119,16 +153,18 @@ window.reviewVim = (function () {
   Vim.defineMotion('moveByPage', (cm, head, args) =>
     moveByPixels(cm, head, (args.repeat || 1) * (window.innerHeight - barBottom() - 2 * lineHeight(cm)), args.forward));
   const startOfLine = (cm, line) => new Pos(line, firstNonBlank(cm.getLine(line)));
-  Vim.defineMotion('moveToTopLine', (cm, _head, args) =>
-    startOfLine(cm, clampLine(cm, cm.lineAtHeight(barBottom() + 2, 'window') + (args.repeat || 1) - 1)));
-  Vim.defineMotion('moveToMiddleLine', cm =>
-    startOfLine(cm, clampLine(cm, cm.lineAtHeight((barBottom() + window.innerHeight) / 2, 'window'))));
-  Vim.defineMotion('moveToBottomLine', (cm, _head, args) =>
-    startOfLine(cm, clampLine(cm, cm.lineAtHeight(window.innerHeight - 2, 'window') - (args.repeat || 1) + 1)));
+  // H, M, and L: the screen rows in view, at the first non-blank if that row starts its line. The view stays put.
+  const rowAt = (cm, y) => {
+    const box = cm.getWrapperElement().getBoundingClientRect(), to = cm.coordsChar({ left: box.left, top: y }, 'window');
+    return to.ch === 0 ? startOfLine(cm, to.line) : to;
+  };
+  Vim.defineMotion('moveToTopLine', (cm, _head, args) => rowAt(cm, visibleTop(cm) + (args.repeat || 1) * lineHeight(cm)));
+  Vim.defineMotion('moveToMiddleLine', cm => rowAt(cm, (visibleTop(cm) + visibleBottom(cm)) / 2));
+  Vim.defineMotion('moveToBottomLine', (cm, _head, args) => rowAt(cm, visibleBottom(cm) - (args.repeat || 1) * lineHeight(cm) - 1));
   Vim.defineAction('scrollToCursor', (cm, args) => {
-    const y = cm.charCoords(new Pos(cm.getCursor().line, 0), 'page').top;
+    const y = cm.cursorCoords(null, 'page').top;
     const to = args.position === 'center' ? y - window.innerHeight / 2 :
-      args.position === 'bottom' ? y - window.innerHeight + 2 * lineHeight(cm) : y - barBottom() - 8;
+      args.position === 'bottom' ? y - visibleBottom(cm) + lineHeight(cm) : y - visibleTop(cm);
     window.scrollTo(0, Math.max(0, to));
   });
   Vim.defineAction('scroll', (cm, args, vim) => {
@@ -541,6 +577,7 @@ window.reviewVim = (function () {
       });
     },
     detach() { stopHold(); current = null; },
+    keepCursorInView,
     // For each editor.
     attach(cm) {
       current = cm;
@@ -548,6 +585,8 @@ window.reviewVim = (function () {
       cm.state.commandGen = cm.changeGeneration();
       cm.on('vim-command-done', () => { if (!cm.state.vim.insertMode) cm.state.commandGen = cm.changeGeneration(); });
       cm.on('beforeChange', (_c, ch) => {
+        // Read-only stops keys, but not : commands, which change the text directly.
+        if (cm.getOption('readOnly') && ch.origin !== 'setValue' && ch.cancel) { ch.cancel(); return; }
         if (ch.origin === 'setValue') cm.state.lineUndo = null;
         // Where this insert began: its first typed character, since A and the like move the cursor after saying so.
         if (cm.state.vim && cm.state.vim.insertMode && ch.origin === '+input' && !cm.state.insertBegan) {
@@ -566,6 +605,14 @@ window.reviewVim = (function () {
       cm.on('cursorActivity', () => {
         const vim = cm.state.vim;
         if (vim && !(cm.curOp && cm.curOp.isVimOp)) vim.lastMotion = null;
+        keepCursorInView(cm);
+      });
+      // This page does its own scrolling to the cursor; the editor's stops short at the toolbar.
+      cm.on('scrollCursorIntoView', (_c, e) => e.preventDefault());
+      window.addEventListener('resize', () => {
+        if (current !== cm) return;
+        if (cm.state.vim) cm.state.vim.lastMotion = null;
+        keepCursorInView(cm);
       });
       cm.on('vim-mode-change', e => {
         if (e.mode === 'insert') {

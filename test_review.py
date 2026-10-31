@@ -388,6 +388,36 @@ class TextFiles(Base):
             self.assertTrue(r.headers['Content-Type'].startswith('text/plain'))
             self.assertEqual(r.headers['X-Content-Type-Options'], 'nosniff')
 
+    def test_closed_items_refuse_saves(self):
+        iid, p = self.queue_text('Plan_v1.md')
+        self.assertEqual(self.call('POST', '/api/items/%s/done' % iid, {})[0], 200)
+        code, r = self.save(iid, 'late edit\n')
+        self.assertEqual((code, r['closed']), (409, True))
+        self.assertFalse((p / 'edited').exists())
+        self.call('DELETE', '/api/items/%s/done' % iid)
+        self.assertEqual(self.save(iid, 'after reopening\n')[0], 200)
+
+    def test_saving_reopens_an_item_that_closed_itself(self):
+        v1, p = self.queue_text('Plan_v1.md')
+        v2, _ = self.queue_text('Plan_v2.md')
+        self.store.sweep()
+        self.assertEqual(self.items()[v1]['status'], 'superseded')
+        code, r = self.save(v1, 'still working on this\n')
+        self.assertEqual((code, r['item']['status']), (200, 'waiting'))
+        self.assertEqual(self.store.sweep(), [])
+
+    def test_superseded_by_hand_refuses_saves(self):
+        v1, _ = self.queue_text('Plan_v1.md')
+        self.save(v1, 'x\n')
+        v2, _ = self.queue_text('Plan_v2.md')
+        self.call('POST', '/api/items/%s/done' % v1, {'superseded_by': v2})
+        self.assertEqual(self.save(v1, 'y\n')[0], 409)
+
+    def test_bad_highlights_get_a_clean_answer(self):
+        iid, _ = self.queue('Paper_v1.pdf')
+        for h in ({'tag': 'change', 'audio': [1]}, {'tag': 'change', 'n': 1e999}):
+            self.assertEqual(self.call('PUT', '/api/items/%s/highlights' % iid, {'base_version': 0, 'max_n': 0, 'highlights': [h]})[0], 400)
+
     def test_keylog(self):
         self.assertEqual(self.call('POST', '/api/keylog?session=../evil', {'a': 1})[0], 400)
         self.assertEqual(self.call('POST', '/api/keylog?session=123', b'not json', 'application/json')[0], 400)

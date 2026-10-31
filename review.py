@@ -1035,7 +1035,7 @@ def make_handler(store, token):
                 highlights = clean_highlights(data.get('highlights'))
                 base = int(data.get('base_version', -1))
                 sent_max = int(data.get('max_n', 0))
-            except (ValueError, KeyError, TypeError) as e:
+            except (ValueError, KeyError, TypeError, AttributeError, OverflowError) as e:
                 return self.json_reply(400, {'error': str(e)})
             with store.item_lock(parts[2]):
                 current = load_highlights(item)
@@ -1062,6 +1062,15 @@ def make_handler(store, token):
                 return self.json_reply(400, {'error': str(e)})
             name = Path(req['text']).name
             with store.item_lock(iid):
+                # "done" must keep meaning finished. But an item that closed itself while being edited reopens:
+                # the reviewer is plainly still working on it.
+                done = read_json(item / 'done.json', None)
+                if done is not None:
+                    if isinstance(done, dict) and done.get('automatic') and done.get('superseded_by'):
+                        (item / 'done.json').unlink()
+                    else:
+                        return self.json_reply(409, {'error': 'this item is closed; Reopen it to keep editing',
+                                                     'closed': True, 'item': summary(root, item)})
                 state = text_state(item, req)
                 if str(data.get('base_sha256')) != state['sha256']:
                     return self.json_reply(409, {'error': 'changed on another device', 'text': state})

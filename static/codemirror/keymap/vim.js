@@ -1475,7 +1475,7 @@ function initVim$1(CodeMirror) {
             if (isKeyword && wholeWordOnly) {
                 query = '\\b' + query + '\\b';
             } else {
-              query = escapeRegex(query);
+              query = getOption('pcre') ? escapeRegex(query) : query.replace(/[.*\[\]\/\\~^$]/g, '\\$&');  // review-server: for Vim's patterns
             }
 
             // cachedCursor is used to save the old position of the cursor
@@ -1817,7 +1817,10 @@ function initVim$1(CodeMirror) {
         // If search is initiated with ? instead of /, negate direction.
         prev = (state.isReversed()) ? !prev : prev;
         highlightSearchMatches(cm, query);
-        return findNext(cm, prev/** prev */, query, motionArgs.repeat);
+        var found = findNext(cm, prev/** prev */, query, motionArgs.repeat);
+        // review-server: say so, rather than doing nothing
+        if (!found) { showConfirm(cm, 'Pattern not found: ' + vimGlobalState.registerController.getRegister('/').toString()); }
+        return found;
       },
       /**
        * Find and select the next occurrence of the search query. If the cursor is currently
@@ -1956,10 +1959,16 @@ function initVim$1(CodeMirror) {
         }
         return best;
       },
-      moveByCharacters: function(_cm, head, motionArgs) {
-        var cur = head;
-        var repeat = motionArgs.repeat;
-        var ch = motionArgs.forward ? cur.ch + repeat : cur.ch - repeat;
+      moveByCharacters: function(cm, head, motionArgs) {
+        // review-server: step over an emoji as one character, never into the middle of it
+        var cur = head, ch = cur.ch, text = cm.getLine(cur.line), repeat = motionArgs.repeat;
+        for (var i = 0; i < repeat; i++) {
+          if (motionArgs.forward) {
+            ch += /[\uD800-\uDBFF]/.test(text.charAt(ch)) ? 2 : 1;
+          } else {
+            ch -= /[\uDC00-\uDFFF]/.test(text.charAt(ch - 1)) ? 2 : 1;
+          }
+        }
         return new Pos(cur.line, ch);
       },
       moveByLines: function(cm, head, motionArgs, vim, inputState) {
@@ -2126,7 +2135,7 @@ function initVim$1(CodeMirror) {
           symbol = lineText.charAt(ch);
           if (symbol && isMatchableSymbol(symbol)) {
             var style = cm.getTokenTypeAt(new Pos(line, ch + 1));
-            if (style !== "string" && style !== "comment") {
+            if (true) {  // review-server: Vim's % also matches brackets in strings and code blocks
               break;
             }
           }
@@ -2238,11 +2247,14 @@ function initVim$1(CodeMirror) {
         var repeat = motionArgs.repeat;
         var forward = motionArgs.forward === lastSearch.forward;
         var increment = (lastSearch.increment ? 1 : 0) * (forward ? -1 : 1);
-        cm.moveH(-increment, 'char');
+        // review-server: stay on the line, unlike moveH
+        var back = cm.getCursor(), step = back.ch - increment;
+        if (step < 0 || step > lineLength(cm, back.line)) { return null; }
+        cm.setCursor(back.line, step);
         motionArgs.inclusive = forward ? true : false;
         var curEnd = moveToCharacter(cm, repeat, forward, lastSearch.selectedCharacter);
         if (!curEnd) {
-          cm.moveH(increment, 'char');
+          cm.setCursor(back);
           return null;  // review-server: as for f
         }
         curEnd.ch += increment;
@@ -4487,9 +4499,30 @@ function initVim$1(CodeMirror) {
     // Handles \v \m \V \c \C \< \> \+ \? \= \| \( \) \%( \{n,m} \{-} \a \l \u \h \x and the like.
     var vimClasses = {a: '[A-Za-z]', A: '[^A-Za-z]', l: '[a-z]', L: '[^a-z]', u: '[A-Z]', U: '[^A-Z]',
       h: '[A-Za-z_]', H: '[^A-Za-z_]', x: '[0-9A-Fa-f]', X: '[^0-9A-Fa-f]', o: '[0-7]', O: '[^0-7]',
-      s: '[ \\t]', S: '[^ \\t]', e: '\\x1b', i: '[A-Za-z_]', I: '[^A-Za-z_]', k: '\\w', K: '[^\\w]', f: '\\S', F: '\\S', p: '\\S', P: '\\S'};
+      s: '[ \\t]', S: '[^ \\t]', W: '[^\\w\\n]', D: '[^\\d\\n]', e: '\\x1b', i: '[A-Za-z_]', I: '[^A-Za-z_]', k: '\\w', K: '[^\\w]', f: '\\S', F: '\\S', p: '\\S', P: '\\S'};
     function translateRegex(str) {
       var out = [], veryMagic = false, noMagic = false, i = 0, ignore = null;
+      var groups = [], lastGroup = -1, closing = 0;
+      // One character class, from its [ to its ]; a [^...] never spans lines in Vim.
+      var bracket = function(at) {
+        var j = at + 1;
+        if (str.charAt(j) == '^') { j++; }
+        if (str.charAt(j) == ']') { j++; }
+        while (j < str.length && str.charAt(j) != ']') {
+          if (str.charAt(j) == '\\') { j++; }
+          else if (str.substr(j, 2) == '[:') { var e = str.indexOf(':]', j); if (e != -1) { j = e + 1; } }
+          j++;
+        }
+        if (j >= str.length) { return null; }
+        var body = str.slice(at, j).replace(/\[:alpha:\]/g, 'A-Za-z').replace(/\[:digit:\]/g, '0-9').replace(/\[:space:\]/g, ' \\t')
+          .replace(/\[:upper:\]/g, 'A-Z').replace(/\[:lower:\]/g, 'a-z').replace(/\[:alnum:\]/g, 'A-Za-z0-9').replace(/\[:punct:\]/g, '!-\\/:-@\\[-`{-~');
+        return { text: body + (str.charAt(at + 1) == '^' ? '\\n]' : ']'), end: j + 1 };
+      };
+      var look = function(kind) {
+        var start = out[out.length - 1] == ')' && lastGroup >= 0 ? lastGroup : -1;
+        var open = { '=': '(?=', '!': '(?!', '<=': '(?<=', '<!': '(?<!' }[kind];
+        if (start >= 0) { out[start] = open; } else { out[out.length - 1] = open + out[out.length - 1] + ')'; }
+      };
       var braces = function(body) {
         var m = /^(-?)(\d*)(,?)(\d*)$/.exec(body);
         if (!m) { return null; }
@@ -4508,14 +4541,33 @@ function initVim$1(CodeMirror) {
           if (n == 'C') { ignore = false; continue; }
           if (n == '<') { out.push(veryMagic ? '<' : '\\b(?=\\w)'); continue; }
           if (n == '>') { out.push(veryMagic ? '>' : '\\b(?<=\\w)'); continue; }
-          if (n == '%' && str.charAt(i) == '(' && !veryMagic) { out.push('(?:'); i++; continue; }
+          if (n == '%' && str.charAt(i) == '(' && !veryMagic) { groups.push(out.length); out.push('(?:'); i++; continue; }
+          if (n == 'z' && str.charAt(i) == 's') { out = ['(?<=' + out.join('') + ')']; groups = []; i++; continue; }
+          if (n == 'z' && str.charAt(i) == 'e') { out.push('(?='); closing++; i++; continue; }
+          if (n == '_') {
+            var what = str.charAt(i);
+            if (what == '[') {
+              var cls = bracket(i);
+              if (cls) { out.push(cls.text.replace(/\\n\]$|\]$/, '') + '\\n]'); i = cls.end; continue; }
+            }
+            i++;
+            out.push(what == '.' ? '[\\s\\S]' : what == 's' ? '\\s' : what == 'd' ? '[\\d\\n]' : what == 'a' ? '[A-Za-z\\n]' : what == 'w' ? '[\\w\\n]' : what == '^' ? '^' : what == '$' ? '$' : '\\' + what);
+            continue;
+          }
+          if (n == '@' && !veryMagic && /^(=|!|<=|<!)/.test(str.slice(i))) {
+            var kind = /^(=|!|<=|<!)/.exec(str.slice(i))[1];
+            look(kind); i += kind.length; continue;
+          }
           if (n == '{' && !veryMagic) {
             var end = str.indexOf('}', i), q = end == -1 ? null : braces(str.slice(i, end).replace(/\\$/, ''));
             if (q) { out.push(q); i = end + 1; continue; }
             out.push('\\{'); continue;
           }
           if ('()|+?='.indexOf(n) != -1) {
-            if (veryMagic) { out.push('\\' + n); } else { out.push(n == '=' ? '?' : n); }
+            if (veryMagic) { out.push('\\' + n); continue; }
+            if (n == '(') { groups.push(out.length); }
+            if (n == ')') { lastGroup = groups.length ? groups.pop() : -1; }
+            out.push(n == '=' ? '?' : n);
             continue;
           }
           if (vimClasses[n]) { out.push(vimClasses[n]); continue; }
@@ -4528,18 +4580,23 @@ function initVim$1(CodeMirror) {
         i++;
         if (noMagic && (c == '.' || c == '*' || c == '[' || c == '~')) { out.push('\\' + c); continue; }
         if (c == '[') {
-          var close = str.indexOf(']', i + (str.charAt(i) == '^' ? 2 : 1));
-          if (close == -1) { out.push('\\['); continue; }
-          out.push(str.slice(i - 1, close + 1).replace(/\[:alpha:\]/g, 'A-Za-z').replace(/\[:digit:\]/g, '0-9')
-            .replace(/\[:space:\]/g, '\\s').replace(/\[:upper:\]/g, 'A-Z').replace(/\[:lower:\]/g, 'a-z'));
-          i = close + 1;
+          var set = bracket(i - 1);
+          if (!set) { out.push('\\['); continue; }
+          out.push(set.text);
+          i = set.end;
           continue;
         }
         if (veryMagic) {
           if (c == '<') { out.push('\\b(?=\\w)'); continue; }
           if (c == '>') { out.push('\\b(?<=\\w)'); continue; }
           if (c == '=') { out.push('?'); continue; }
-          if (c == '%' && n == '(') { out.push('(?:'); i++; continue; }
+          if (c == '@' && /^(=|!|<=|<!)/.test(str.slice(i))) {
+            var vkind = /^(=|!|<=|<!)/.exec(str.slice(i))[1];
+            look(vkind); i += vkind.length; continue;
+          }
+          if (c == '(') { groups.push(out.length); }
+          if (c == ')') { lastGroup = groups.length ? groups.pop() : -1; }
+          if (c == '%' && n == '(') { groups.push(out.length); out.push('(?:'); i++; continue; }
           if (c == '{') {
             var vend = str.indexOf('}', i), vq = vend == -1 ? null : braces(str.slice(i, vend));
             if (vq) { out.push(vq); i = vend + 1; continue; }
@@ -4554,6 +4611,7 @@ function initVim$1(CodeMirror) {
         if (c == '$' && i < str.length && n !== '' && str.slice(i, i + 2) != '\\|' && str.slice(i, i + 2) != '\\)') { out.push('\\$'); continue; }
         out.push(c);
       }
+      for (; closing > 0; closing--) { out.push(')'); }
       translateRegex.ignoreCase = ignore;
       return out.join('');
     }

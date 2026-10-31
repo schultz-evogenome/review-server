@@ -89,13 +89,14 @@
   window.addEventListener('hashchange', route);
   $('#back').addEventListener('click', async () => {
     await flush();
-    if (T.cm && (T.conflict || T.dirty)) { toast(T.conflict ? 'Choose a version first' : 'Your edits are not saved yet; try again in a moment', 4000); return; }
+    if (unsavedWarning()) return;
     location.hash = '#/';
   });
   $('#refresh').addEventListener('click', () => showQueue());
 
   function route() {
     const m = location.hash.match(/^#\/item\/([0-9a-f]{6,40})$/);
+    if (m && T.cm && S.item && S.item.id === m[1]) return;     // came back from a refused Back
     if (m) openItem(m[1]); else showQueue();
   }
 
@@ -103,6 +104,8 @@
 
   async function showQueue() {
     await flush();
+    // Back in the browser comes here too: stay with text that could not be saved.
+    if (T.cm && S.item && unsavedWarning()) { location.hash = '#/item/' + S.item.id; return; }
     teardown();
     S.item = null;
     $('#viewer').hidden = true; $('#queue').hidden = false; $('#brief').hidden = true;
@@ -273,7 +276,7 @@
     nodes: new Map(),  // figures already built, kept so they need not load again
     addRef: null,
   };
-  const CM = '/static/codemirror/', CM_VERSION = '?v=2';   // these files are cached; raise this when they change
+  const CM = '/static/codemirror/', CM_VERSION = '?v=3';   // these files are cached; raise this when they change
   const pref = {
     get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
     set(k, v) { try { localStorage.setItem(k, v); } catch (e) { /* not remembered */ } },
@@ -317,16 +320,19 @@
     T.endsInBreak = /\n$/.test(t.current);
     T.crlf = /\r\n/.test(t.current); T.images = t.images || {};
     T.conflict = null; T.dirty = false; T.refs = []; T.imgKey = ''; T.nodes = new Map(); T.marks = [];
+    T.saveError = ''; T.lastSent = null; T.typingSince = 0;
+    // Every line's ending, so that one edit does not rewrite the endings of the others.
+    T.origEnds = /\r/.test(t.original) ? t.original.match(/\r\n?|\n/g) || [] : null;
     $('#conflict').hidden = true;
     $('#vimOn').checked = pref.get('review.vim') === '1';
     T.cm = CodeMirror($('#editor'), {
       value: t.current.replace(/\r?\n$/, ''),
+      indentWithTabs: /^\t/m.test(t.current),
       mode: /\.tex$/.test(name) ? 'stex' : /\.(md|markdown)$/.test(name) ? { name: 'markdown', highlightFormatting: true } : null,
       theme: 'goyo',
       keyMap: $('#vimOn').checked ? 'vim' : 'default',
       lineWrapping: true,            // wraps on screen only; the file's line breaks stay as they are
       viewportMargin: Infinity,      // the page scrolls, not a box inside it
-      cursorScrollMargin: 120,
       matchBrackets: true,
       showCursorWhenSelecting: true,
       spellcheck: true,
@@ -335,6 +341,7 @@
     });
     T.cm.on('change', onTextChange);
     window.reviewVim.attach(T.cm);
+    restoreDraft(t);
     T.cm.on('vim-mode-change', e => showVimMode(e.mode + (e.subMode ? ' ' + e.subMode : '')));
     showVimMode('normal');
     refreshChanges(); refreshImages(); updateWords();
@@ -382,18 +389,65 @@
   function editorText() {
     const nl = T.cm.getValue('\n');
     if (nl === T.origLines.join('\n')) return T.original;      // exactly as queued, whatever its line endings
-    const end = T.endsInBreak ? (T.crlf ? '\r\n' : '\n') : '';
-    return (T.crlf ? T.cm.getValue('\r\n') : nl) + end;
+    // A lone half of an emoji cannot be stored, and would stop every later save.
+    const clean = nl.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '\uFFFD');
+    if (!T.origEnds) return clean + (T.endsInBreak ? '\n' : '');
+    // Lines that have not changed keep their own endings; new ones take the file's most common.
+    const crlf = T.origEnds.filter(e => e === '\r\n').length, lf = T.origEnds.filter(e => e === '\n').length, usual = crlf >= lf ? '\r\n' : '\n';
+    const now = clean.split('\n'), out = [];
+    let a = 0, b = 0;
+    const put = (line, end, last) => out.push(line, last ? '' : end);
+    for (const [a0, a1, b0, b1] of diffSeq(T.origLines, now).concat([[T.origLines.length, T.origLines.length, now.length, now.length]])) {
+      while (b < b0) { put(now[b], T.origEnds[a] || usual, b === now.length - 1); a++; b++; }
+      while (b < b1) { put(now[b], (a1 - a0 === b1 - b0 && T.origEnds[a0 + b - b0]) || usual, b === now.length - 1); b++; }
+      a = a1;
+    }
+    if (T.endsInBreak) out.push(T.origEnds[T.origEnds.length - 1] || usual);
+    return out.join('');
   }
+
+  // A copy of unsaved text in this browser, in case the page closes before it reaches the server.
+  const draftKey = () => 'review.draft.' + S.item.id;
+  function keepDraft() {
+    if (!T.cm || !S.item) return;
+    try { localStorage.setItem(draftKey(), JSON.stringify({ base: T.sha, text: editorText(), at: Date.now() })); } catch (e) { /* too big, or not allowed */ }
+  }
+  function dropDraft() { try { localStorage.removeItem(draftKey()); } catch (e) { /* nothing kept */ } }
+  function restoreDraft(t) {
+    let d = null;
+    try { d = JSON.parse(localStorage.getItem(draftKey())); } catch (e) { /* none */ }
+    if (!d) return;
+    if (d.text === t.current || d.base !== t.sha256 || S.reopen) { dropDraft(); return; }
+    T.cm.setValue(d.text.replace(/\r?\n$/, ''));
+    toast('Restored edits that had not reached the server', 5000);
+  }
+
+  // Why the page should not be left, if there is a reason; says so.
+  function unsavedWarning() {
+    if (!T.cm) return false;
+    if (T.conflict) { toast('Choose a version first', 4000); $('#conflict').hidden = false; return true; }
+    if (T.dirty || T.saving) {
+      document.body.classList.remove('typing');
+      toast(T.saveError ? 'Not saved: ' + T.saveError : 'Your edits are not saved yet; try again in a moment', 5000);
+      return true;
+    }
+    return false;
+  }
+  window.addEventListener('beforeunload', e => {
+    if (T.cm && (T.dirty || T.saving || T.conflict)) { keepDraft(); e.preventDefault(); e.returnValue = ''; }
+  });
 
   function onTextChange() {
     T.dirty = true;
     setStatus('Not saved yet');
     document.body.classList.add('typing');
     clearTimeout(T.timer);
-    T.timer = setTimeout(saveText, 600);
+    // Save when typing pauses, and at least every few seconds during steady typing.
+    const now = Date.now();
+    if (!T.typingSince) T.typingSince = now;
+    T.timer = setTimeout(saveText, now - T.typingSince > 4000 ? 0 : 600);
     clearTimeout(T.refreshTimer);
-    T.refreshTimer = setTimeout(() => { if (T.cm) { refreshChanges(); refreshImages(); updateWords(); renderPreview(); } }, 250);
+    T.refreshTimer = setTimeout(() => { if (T.cm) { keepDraft(); refreshChanges(); refreshImages(); updateWords(); renderPreview(); } }, 250);
   }
 
   function updateWords() {
@@ -404,40 +458,78 @@
   async function saveText() {
     if (!T.cm || T.conflict) return;
     if (T.saving) { clearTimeout(T.timer); T.timer = setTimeout(saveText, 400); return; }
-    T.saving = true; T.dirty = false; setStatus('Saving…');
-    const id = S.item.id;
+    T.saving = true; T.typingSince = 0; setStatus('Saving…');
+    const id = S.item.id, cm = T.cm, text = editorText();
+    T.lastSent = text;
     try {
-      const r = await api('/api/items/' + id + '/text', { method: 'PUT', body: JSON.stringify({ base_sha256: T.sha, text: editorText() }) });
-      T.sha = r.text.sha256;
+      const r = await api('/api/items/' + id + '/text', { method: 'PUT', body: JSON.stringify({ base_sha256: T.sha, text }) });
+      if (T.cm !== cm) return;
+      T.sha = r.text.sha256; T.saveError = '';
+      T.dirty = editorText() !== text;     // still unsaved until the server has it, and if typing went on
+      if (!T.dirty) dropDraft();
       if (S.item && S.item.id === id) S.item = r.item;
       setStatus(T.dirty ? 'Not saved yet' : 'Saved');
+      if (T.dirty) { clearTimeout(T.timer); T.timer = setTimeout(saveText, 600); }
     } catch (e) {
+      if (T.cm !== cm) return;
       T.dirty = true;
-      if (e.status === 409 && e.body && e.body.text) showConflict(e.body.text);
-      else if (e.status >= 400 && e.status < 500) setStatus('Not saved: ' + e.message);
-      else { setStatus('Not saved; retrying'); clearTimeout(T.timer); T.timer = setTimeout(saveText, 4000); }
+      keepDraft();
+      if (e.status === 409 && e.body && e.body.closed) {
+        T.saveError = e.message;
+        setStatus('Not saved');
+        document.body.classList.remove('typing');
+        S.item = e.body.item;
+        updateDoneBtn();
+        toast(e.message, 6000);
+      } else if (e.status === 409 && e.body && e.body.text) {
+        showConflict(e.body.text);
+      } else if (e.status >= 400 && e.status < 500) {
+        T.saveError = e.message;
+        setStatus('Not saved: ' + e.message);
+        document.body.classList.remove('typing');
+        toast('Not saved: ' + e.message, 6000);
+      } else {
+        T.saveError = 'the server cannot be reached';
+        setStatus('Not saved; retrying');
+        document.body.classList.remove('typing');
+        clearTimeout(T.timer);
+        T.timer = setTimeout(saveText, 4000);
+      }
     } finally {
       T.saving = false;
     }
   }
   async function flushText() {
     if (!T.cm) return;
+    // Text still being composed, as by dictation, is not in the editor until this.
+    const input = T.cm.display && T.cm.display.input;
+    if (input && input.forceCompositionEnd) { try { input.forceCompositionEnd(); } catch (e) { /* no composition */ } }
+    if (input && input.poll) { try { input.poll(); } catch (e) { /* nothing to read */ } }
     clearTimeout(T.timer);
-    for (let i = 0; i < 40 && T.saving; i++) await new Promise(r => setTimeout(r, 100));
-    if (T.dirty && !T.conflict) await saveText();
+    for (let i = 0; i < 300 && T.saving; i++) await new Promise(r => setTimeout(r, 100));
+    if (T.dirty && !T.conflict && !T.saving) await saveText();
   }
   async function saveNow() {
     await flushText();
-    if (T.cm && !T.dirty && !T.conflict) toast('Saved');
+    if (!T.cm) return;
+    if (T.dirty || T.conflict || T.saving) unsavedWarning();
+    else toast('Saved');
   }
 
   function showConflict(server) {
     if (T.cm && server.current === editorText()) {      // our last save arrived; only its answer was lost
-      T.sha = server.sha256; T.dirty = false; setStatus('Saved');
+      T.sha = server.sha256; T.dirty = false; T.saveError = ''; dropDraft(); setStatus('Saved');
+      return;
+    }
+    if (T.cm && server.current === T.lastSent) {        // the same, and there has been more typing since
+      T.sha = server.sha256;
+      clearTimeout(T.timer);
+      T.timer = setTimeout(saveText, 0);
       return;
     }
     T.conflict = server;
     setStatus('Not saved');
+    document.body.classList.remove('typing');
     $('#conflict').hidden = false;
   }
   $('#keepMine').addEventListener('click', () => {
@@ -457,6 +549,13 @@
   $('#revertBtn').addEventListener('click', () => {
     if (!T.cm || T.cm.getOption('readOnly')) return;
     if (T.cm.getValue('\n') === T.origLines.join('\n')) { toast('There are no edits'); return; }
+    const btn = $('#revertBtn');
+    if (!btn.dataset.armed) {          // two taps, because a reload after this cannot be undone
+      btn.dataset.armed = '1'; btn.textContent = 'Tap again to revert';
+      setTimeout(() => { delete btn.dataset.armed; btn.textContent = 'Revert'; }, 3000);
+      return;
+    }
+    delete btn.dataset.armed; btn.textContent = 'Revert';
     T.cm.setValue(T.origLines.join('\n'));
     toast('Back to the file as queued. Undo brings your edits back.', 4000);
   });
@@ -514,7 +613,7 @@
       T.marks.forEach(m => m.clear());
       T.marks = [];
       const { spans, gone } = changedSpans(cm.getValue('\n').split('\n'));
-      for (const x of spans) T.marks.push(cm.markText({ line: x.line, ch: x.from }, { line: x.line, ch: x.to }, { className: 'cm-changed' }));
+      for (const x of spans.slice(0, 5000)) T.marks.push(cm.markText({ line: x.line, ch: x.from }, { line: x.line, ch: x.to }, { className: 'cm-changed' }));
       for (const x of gone) {
         const w = document.createElement('span');
         w.className = 'cm-gone';
@@ -550,7 +649,7 @@
 
   function imageSrc(ref) {
     if (/^(data:image\/|https?:\/\/)/i.test(ref)) return ref;
-    return T.images[ref] ? '/api/items/' + S.item.id + '/images/' + encodeURIComponent(T.images[ref]) : null;
+    return Object.prototype.hasOwnProperty.call(T.images, ref) ? '/api/items/' + S.item.id + '/images/' + encodeURIComponent(T.images[ref]) : null;
   }
   const refLabel = ref => (/^data:/i.test(ref) ? 'embedded image' : ref);
 
@@ -576,7 +675,10 @@
       } else {
         const img = document.createElement('img');
         img.alt = x.alt; img.src = src;
-        img.addEventListener('load', () => { if (fig.widget) fig.widget.changed(); });
+        img.addEventListener('load', () => {
+          if (fig.widget) fig.widget.changed();
+          if (T.cm && window.reviewVim) window.reviewVim.keepCursorInView(T.cm);
+        });
         a.appendChild(img);
       }
       fig.appendChild(a);
@@ -596,6 +698,7 @@
       await page.render({ canvasContext: canvas.getContext('2d'), viewport: vp }).promise;
       pdf.destroy();
       if (fig.widget) fig.widget.changed();
+      if (T.cm && window.reviewVim) window.reviewVim.keepCursorInView(T.cm);
     } catch (e) {
       $('figcaption', fig).textContent += ' (could not draw this PDF: ' + e.message + ')';
     }
@@ -1078,6 +1181,7 @@
 
   function addFromRange(range, tag, snap) {
     if (!range) return;
+    if (S.reopen) { toast('Reopen it to add highlights'); return; }
     if (snap) snapToWords(range);
     const rects = rangeParts(range), text = rangeText(range);
     if (!rects.length || !text) { toast('No text there'); return; }
@@ -1230,6 +1334,8 @@
   function openSheet(n, focusNote) {
     const h = S.hl.find(x => x.n === n);
     if (!h) return;
+    clearTimeout(noteTimer);
+    commitNote();                      // the note still being typed belongs to the highlight it was typed for
     S.openN = n;
     $('#sheetNum').textContent = '#' + h.n;
     $('#sheetPage').textContent = 'page ' + h.page;
@@ -1571,7 +1677,7 @@
     if (!S.item) return;
     closeSheet();
     await flush();
-    if (T.cm && (T.conflict || T.dirty)) { toast(T.conflict ? 'Choose a version first' : 'Your edits are not saved yet; try again in a moment', 4000); return; }
+    if (unsavedWarning()) return;
     try {
       if (S.reopen) {
         S.item = (await api('/api/items/' + S.item.id + '/done', { method: 'DELETE' })).item;
