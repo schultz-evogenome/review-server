@@ -33,7 +33,7 @@ class Base(unittest.TestCase):
     auto_close = True
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = Path(tempfile.mkdtemp()).resolve()
         self.repo = self.tmp / 'repo' / 'Applications' / 'App'
         self.repo.mkdir(parents=True)
         self.inbox = self.tmp / 'inbox'
@@ -73,7 +73,8 @@ class Base(unittest.TestCase):
             with urllib.request.urlopen(req, timeout=10) as r:
                 return r.status, json.load(r)
         except urllib.error.HTTPError as e:
-            return e.code, json.load(e)
+            with e:
+                return e.code, json.load(e)
 
     def items(self):
         return {s['id']: s for s in self.call('GET', '/api/items')[1]['items']}
@@ -282,6 +283,180 @@ class Versions(Base):
         self.assertIn('superseded by v2', out.getvalue())
         self.assertIn('waiting', out.getvalue())
         self.assertIn('Plan, version 1', out.getvalue())
+
+
+class TextFiles(Base):
+    def detail(self, iid):
+        return self.call('GET', '/api/items/%s' % iid)[1]
+
+    def save(self, iid, text, base=None):
+        base = self.detail(iid)['text']['sha256'] if base is None else base
+        return self.call('PUT', '/api/items/%s/text' % iid, {'base_sha256': base, 'text': text})
+
+    def queue_text(self, name, body=b'one\ntwo\n', **meta):
+        meta.setdefault('title', name)
+        item = review.make_item(self.repo, name, body, meta)
+        return review.item_id(item), item
+
+    def test_upload_kinds(self):
+        for name, ok in (('a_v1.md', True), ('b.txt', True), ('c_v2.tex', True), ('d.docx', False)):
+            code, r = self.call('POST', '/api/queue?title=t&filename=%s' % name, b'hello\n', 'text/plain')
+            self.assertEqual(code, 200 if ok else 400, name)
+            if ok:
+                self.assertEqual((r['item']['kind'], r['item']['file'], r['item']['pdf']), ('text', name, ''))
+        self.assertEqual(self.call('POST', '/api/queue?title=t&filename=e.md', b'\xff\xfe latin', 'text/plain')[0], 400)
+        self.assertEqual(self.call('POST', '/api/queue?title=t&filename=f.md', b'a\0b', 'text/plain')[0], 400)
+        self.assertEqual(self.call('POST', '/api/queue?title=t&filename=g.md', PDF, 'text/plain')[0], 400)
+        self.assertEqual(self.call('POST', '/api/queue?title=t&filename=h.pdf', b'not a pdf', 'application/pdf')[0], 400)
+        code, r = self.call('POST', '/api/queue?title=t&filename=i.pdf', PDF, 'application/pdf')
+        self.assertEqual((code, r['item']['kind'], r['item']['pdf']), (200, 'pdf', 'i.pdf'))
+
+    def test_edit_keeps_the_original(self):
+        iid, p = self.queue_text('Plan_v1.md', 'caf\u00e9\n'.encode())
+        self.assertEqual(self.detail(iid)['text']['current'], 'caf\u00e9\n')
+        code, r = self.save(iid, 'caf\u00e9 au lait\n')
+        self.assertEqual((code, r['text']['edited'], r['item']['edited']), (200, True, True))
+        self.assertEqual((p / 'Plan_v1.md').read_text(encoding='utf-8'), 'caf\u00e9\n')
+        self.assertEqual((p / 'edited' / 'Plan_v1.md').read_text(encoding='utf-8'), 'caf\u00e9 au lait\n')
+        self.assertEqual(json.loads((p / 'request.json').read_text())['sha256'],
+                         review.sha256_bytes('caf\u00e9\n'.encode()))
+        d = self.detail(iid)['text']
+        self.assertEqual((d['original'], d['current']), ('caf\u00e9\n', 'caf\u00e9 au lait\n'))
+        self.assertIn('+caf\u00e9 au lait', d['diff'])
+
+    def test_line_endings_and_no_newline_kept(self):
+        iid, p = self.queue_text('a.txt', b'one\r\ntwo')
+        self.assertEqual(self.save(iid, 'one\r\nTWO')[0], 200)
+        self.assertEqual((p / 'edited' / 'a.txt').read_bytes(), b'one\r\nTWO')
+
+    def test_undoing_every_edit_means_no_edits(self):
+        iid, p = self.queue_text('Plan_v1.md')
+        self.save(iid, 'changed\n')
+        code, r = self.save(iid, 'one\ntwo\n')
+        self.assertEqual((code, r['text']['edited'], r['item']['edited']), (200, False, False))
+        self.assertFalse((p / 'edited').exists())
+
+    def test_conflict(self):
+        iid, p = self.queue_text('Plan_v1.md')
+        base = self.detail(iid)['text']['sha256']
+        self.assertEqual(self.save(iid, 'first device\n', base)[0], 200)
+        code, r = self.save(iid, 'second device\n', base)
+        self.assertEqual((code, r['text']['current']), (409, 'first device\n'))
+        self.assertEqual((p / 'edited' / 'Plan_v1.md').read_text(), 'first device\n')
+
+    def test_bad_saves(self):
+        iid, _ = self.queue_text('Plan_v1.md')
+        pdf, _ = self.queue('Paper_v1.pdf')
+        self.assertEqual(self.call('PUT', '/api/items/%s/text' % iid, {'base_sha256': 'x'})[0], 400)
+        self.assertEqual(self.save(iid, 'a\0b')[0], 400)
+        self.assertEqual(self.save(iid, 'x' * (review.MAX_TEXT + 1))[0], 400)
+        self.assertEqual(self.call('PUT', '/api/items/%s/text' % pdf, {'base_sha256': 'x', 'text': 'y'})[0], 400)
+
+    def test_edited_older_version_stays(self):
+        v1, _ = self.queue_text('Plan_v1.md')
+        v2, _ = self.queue_text('Plan_v2.md')
+        v3, _ = self.queue_text('Plan_v3.md')
+        self.save(v1, 'my edits\n')
+        self.assertEqual([s['id'] for s, _ in self.store.sweep()], [v2])
+        items = self.items()
+        self.assertEqual((items[v1]['status'], items[v2]['status'], items[v3]['status']), ('waiting', 'superseded', 'waiting'))
+        code, r = self.call('POST', '/api/items/%s/done' % v1, {'superseded_by': v3})   # Mark older done, after asking
+        self.assertEqual((code, r['item']['status'], r['item']['edited']), (200, 'superseded', True))
+
+    def test_done_and_show(self):
+        iid, p = self.queue_text('Plan_v1.md', title='The plan')
+        self.save(iid, 'one\ntwo and more\n')
+        self.assertEqual(self.call('POST', '/api/items/%s/done' % iid, {})[0], 200)
+        self.assertTrue(json.loads((p / 'done.json').read_text())['edited'])
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            review.main(['show', str(p), '--root', str(self.tmp / 'repo')])
+        self.assertIn('Done ', out.getvalue())
+        self.assertIn('+two and more', out.getvalue())
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            review.main(['pull', 'The plan', '--server', self.base])
+        self.assertIn('+two and more', out.getvalue())
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            review.main(['list', '--all', '--root', str(self.tmp / 'repo')])
+        self.assertIn('text, edited', out.getvalue())
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            review.main(['show', str(p), '--json', '--root', str(self.tmp / 'repo')])
+        self.assertEqual(json.loads(out.getvalue())['text']['current'], 'one\ntwo and more\n')
+
+    def test_file_served_as_plain_text(self):
+        iid, _ = self.queue_text('a.md', b'<script>alert(1)</script>\n')
+        with urllib.request.urlopen(self.base + '/api/items/%s/file' % iid) as r:
+            self.assertTrue(r.headers['Content-Type'].startswith('text/plain'))
+            self.assertEqual(r.headers['X-Content-Type-Options'], 'nosniff')
+
+    def test_image_references(self):
+        refs = review.image_refs
+        self.assertEqual(refs('a.md', '![x](fig/b.png "t")\n<img src="c.jpg">\n![](d.png)\n![](data:image/png;base64,AA)\n'
+                                      '![](https://e.org/f.png)\n![again](fig/b.png)'), ['fig/b.png', 'c.jpg', 'd.png'])
+        self.assertEqual(refs('a.tex', '% \\includegraphics{no}\n\\includegraphics[width=2in]{yes}\n50\\% \\includegraphics{two.pdf} % \\includegraphics{no2}'),
+                         ['yes', 'two.pdf'])
+        self.assertEqual(refs('a.txt', '![x](b.png)'), [])
+
+    def write_doc(self, text):
+        d = self.tmp / 'repo' / 'paper'
+        (d / 'fig').mkdir(parents=True, exist_ok=True)
+        (self.tmp / 'repo' / '.git').mkdir(exist_ok=True)
+        (d / 'fig' / 'one.png').write_bytes(b'\x89PNG one')
+        (d / 'fig' / 'two.pdf').write_bytes(PDF)
+        (self.tmp / 'repo' / 'shared.png').write_bytes(b'\x89PNG shared')
+        (self.tmp / 'outside.png').write_bytes(b'\x89PNG secret')
+        doc = d / 'doc_v1.tex'
+        doc.write_text(text)
+        return doc
+
+    def test_queue_brings_images(self):
+        doc = self.write_doc('\\graphicspath{{fig/}}\n\\includegraphics{one}\n\\includegraphics{two.pdf}\n'
+                             '\\includegraphics{../shared.png}\n\\includegraphics{../../outside.png}\n\\includegraphics{gone}\n')
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(err):
+            review.main(['queue', str(doc), '--title', 'Doc', '--into', str(self.repo)])
+        item = Path(out.getvalue().strip())
+        images = json.loads((item / 'request.json').read_text())['images']
+        self.assertEqual(sorted(images), ['../shared.png', 'one', 'two.pdf'])     # nothing from outside the repository
+        self.assertIn('outside.png', err.getvalue())
+        self.assertIn('gone', err.getvalue())
+        self.assertEqual((item / 'images' / images['one']).read_bytes(), b'\x89PNG one')
+        iid = review.item_id(item)
+        self.assertEqual(self.detail(iid)['text']['images'], images)
+        with urllib.request.urlopen(self.base + '/api/items/%s/images/%s' % (iid, images['one'])) as r:
+            self.assertEqual((r.headers['Content-Type'], r.read()), ('image/png', b'\x89PNG one'))
+
+    def test_push_sends_images(self):
+        doc = self.write_doc('\\includegraphics{fig/one.png}\n')
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(err):
+            review.main(['push', str(doc), '--server', self.base, '--title', 'Doc'])
+        self.assertIn('Sent image fig/one.png', out.getvalue())
+        s = [s for s in self.items().values() if s['title'] == 'Doc'][0]
+        self.assertEqual(list(self.detail(s['id'])['text']['images']), ['fig/one.png'])
+
+    def test_add_image_checks(self):
+        iid, p = self.queue_text('a.md', b'![x](b.png)\n')
+        pdf, _ = self.queue('Paper_v1.pdf')
+        post = lambda i, q, body=b'data': self.call('POST', '/api/items/%s/images?%s' % (i, q), body, 'image/png')
+        self.assertEqual(post(pdf, 'ref=b.png&filename=b.png')[0], 400)
+        self.assertEqual(post(iid, 'ref=b.png&filename=b.exe')[0], 400)
+        self.assertEqual(post(iid, 'filename=b.png')[0], 400)
+        self.assertEqual(post(iid, 'ref=b.png&filename=b.png', b'')[0], 400)
+        code, r = post(iid, 'ref=b.png&filename=../../evil.png')
+        self.assertEqual((code, r['images']), (200, {'b.png': '001_evil.png'}))
+        self.assertTrue((p / 'images' / '001_evil.png').is_file())
+        code, r = post(iid, 'ref=b.png&filename=other.png', b'new')                # replacing keeps its place
+        self.assertEqual(r['images'], {'b.png': '001_evil.png'})
+        self.assertEqual((p / 'images' / '001_evil.png').read_bytes(), b'new')
+        self.assertEqual(self.call('GET', '/api/items/%s/images/..%%2Frequest.json' % iid)[0], 404)
+        self.assertEqual(self.call('GET', '/api/items/%s/images/nope.png' % iid)[0], 404)
+
+    def test_svg_is_sandboxed(self):
+        iid, _ = self.queue_text('a.md', b'![x](b.svg)\n')
+        self.call('POST', '/api/items/%s/images?ref=b.svg&filename=b.svg' % iid, b'<svg/>', 'image/svg+xml')
+        with urllib.request.urlopen(self.base + '/api/items/%s/images/001_b.svg' % iid) as r:
+            self.assertIn('sandbox', r.headers['Content-Security-Policy'])
+            self.assertEqual(r.headers['Content-Type'], 'image/svg+xml')
 
 
 class NoAutoClose(Base):

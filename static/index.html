@@ -8,6 +8,7 @@
 <meta name="apple-mobile-web-app-title" content="Review">
 <meta name="color-scheme" content="light dark">
 <title>Review queue</title>
+<script>try { var t = localStorage.getItem('review.theme'); if (t === 'dark' || t === 'light') document.documentElement.dataset.theme = t; } catch (e) {}</script>
 <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
@@ -16,8 +17,10 @@
     <button id="back" hidden>&lsaquo; Queue</button>
     <h1 id="title">Review queue</h1>
     <span id="status" aria-live="polite"></span>
-    <button id="addBtn" hidden title="Add a PDF from this device to the queue">Add PDF</button>
-    <input type="file" id="addFile" accept="application/pdf,.pdf" hidden>
+    <button id="themeBtn" title="Follow the device, or stay dark or light">Theme: auto</button>
+    <button id="addBtn" hidden title="Add a PDF or text file from this device to the queue">Add file</button>
+    <input type="file" id="addFile" accept="application/pdf,.pdf,text/plain,.txt,text/markdown,.md,.markdown,.tex" hidden>
+    <input type="file" id="imageFile" accept="image/*,application/pdf,.pdf,.svg" hidden>
     <button id="refresh" title="Reload the queue">Refresh</button>
     <button id="doneBtn" class="primary" hidden>Done</button>
   </div>
@@ -31,14 +34,32 @@
     <span class="spacer"></span>
     <button id="listBtn">List</button>
   </div>
+  <div class="row tools" id="textTools" hidden>
+    <label class="check"><input type="checkbox" id="vimOn"> Vim keys</label>
+    <span id="wordCount" class="muted"></span>
+    <span class="spacer"></span>
+    <button id="imagesBtn" hidden>Images</button>
+    <button id="revertBtn" title="Go back to the file as queued">Revert</button>
+  </div>
 </header>
+
+<div id="brief" hidden></div>
 
 <main id="queue"></main>
 
 <main id="viewer" hidden>
-  <div id="brief" hidden></div>
   <div id="pages"></div>
 </main>
+
+<main id="editor" hidden></main>
+
+<div id="vimMode" hidden></div>
+
+<div id="conflict" class="floating" hidden>
+  <span>This file changed on another device.</span>
+  <button id="keepMine">Keep mine</button>
+  <button id="useOther">Use the other</button>
+</div>
 
 <div id="selbar" class="floating" hidden>
   <span>Mark selection</span>
@@ -72,6 +93,8 @@
 </section>
 
 <aside id="list" hidden aria-label="Highlights"></aside>
+
+<aside id="imagesPanel" hidden aria-label="Images"></aside>
 
 <section id="addPanel" hidden aria-label="Add a PDF">
   <h2>Add to the queue</h2>

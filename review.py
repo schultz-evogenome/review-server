@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Review queue: PDFs waiting for markup on an iPad, or in any browser.
+"""Review queue: PDFs waiting for markup on an iPad, or in any browser, and text files to edit.
 
 Agents queue a PDF. You open the queue in a browser, highlight text by selecting it or by
 drawing over it with an Apple Pencil, tag each highlight "change" or "discuss", add a note
 if you like (the iPad keyboard's microphone dictates it), and tap Done. Agents then read the
-numbered highlights and match them with what you tell them.
+numbered highlights and match them with what you tell them. A .txt, .md, or .tex file opens in
+an editor instead (regular or vim keys); agents then read your edits as a diff.
 
 Everything is plain files, so any agent can take part and git can carry them:
 
@@ -12,31 +13,36 @@ Everything is plain files, so any agent can take part and git can carry them:
         <name>.pdf        an exact copy of the file under review
         request.json      title, note to the reviewer, who queued it and when, sha256
         highlights.json   written by the server as you mark the file
+        <name>.md         for a text file, an exact copy as queued, instead of the PDF
+        edited/<name>.md  written by the server as you edit a text file; deleted if you undo every edit
+        images/           the images a text file refers to, listed under "images" in request.json
         done.json         written when you tap Done, or when a newer version replaces the item
                           (then with superseded_by); deleted if you reopen the item
 
 Commands (Python 3.8 or later, standard library only):
 
   On the machine that holds the files:
-    review.py queue FILE.pdf --title TITLE [--note NOTE] [--by NAME] [--into FOLDER] [--doc DOC] [--version N]
+    review.py queue FILE --title TITLE [--note NOTE] [--by NAME] [--into FOLDER] [--doc DOC] [--version N]
     review.py list  [--root DIR ...] [--all]
     review.py show  ITEM [--root DIR ...] [--json]
     review.py serve [--root DIR ...] [--inbox DIR] [--lan] [--host 127.0.0.1] [--port 8765]
                     [--no-auto-close] [--state FILE]
 
   From any other machine that can reach the server:
-    review.py push FILE.pdf --server URL --title TITLE [--note NOTE] [--by NAME] [--group NAME] [--doc DOC] [--version N]
+    review.py push FILE --server URL --title TITLE [--note NOTE] [--by NAME] [--group NAME] [--doc DOC] [--version N]
     review.py pull [ITEM] --server URL [--json]
 
 Versions: the last _v<digits> in the PDF's name (followed by _, the extension, or the end) is its version,
 and everything before it names the document, so Plan_v8_review.pdf and Plan_v9.pdf are versions 8 and 9
 of Plan. --doc and --version set them instead. When a higher version of a document is queued, the server
 closes the older waiting versions that have no highlights and no voice notes; their status becomes
-"superseded", not "done". serve --no-auto-close turns that off.
+"superseded", not "done". Edited text counts as marked. serve --no-auto-close turns that off.
 
 --root defaults to the folders listed in $REVIEW_ROOTS (separated by ":"), else the current
 folder. ITEM is an item folder, its name, its id, or (for pull) words from its title.
-serve --inbox names the folder where PDFs sent with push or the page's Add PDF button go.
+FILE is a PDF, or a UTF-8 text file ending in .txt, .md, .markdown, or .tex. queue and push also send
+the images a text file refers to (![](...), <img>, \\includegraphics) if they are in its folder or git repository.
+serve --inbox names the folder where files sent with push or the page's Add file button go.
 
 serve --lan listens on the local network as well. Other devices then need a token, which the
 server prints in the address to open; it is kept in ~/.config/review-server/token (or set
@@ -49,6 +55,7 @@ installed for the Python that runs the server, each clip is turned into text in 
 """
 import argparse
 import datetime as dt
+import difflib
 import hashlib
 import http.server
 import json
@@ -83,6 +90,14 @@ SAFE_FILE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,150}$')
 VERSION = re.compile(r'_[vV]([0-9]+)(?=_|\.[A-Za-z0-9]+$|$)')
 IDLE_UNLOAD = 15 * 60          # seconds without voice notes before the speech model is unloaded
 SWEEP = 3                      # seconds between checks for older versions to close
+TEXT_EXT = ('.txt', '.md', '.markdown', '.tex')
+MAX_TEXT = 5 * 1024 * 1024
+IMAGE_TYPES = {'.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif',
+               '.webp': 'image/webp', '.svg': 'image/svg+xml', '.pdf': 'application/pdf'}
+MAX_IMAGE = 25 * 1024 * 1024
+MD_IMAGE = re.compile(r'!\[[^\]]*\]\(\s*<?([^)\s>]+)>?[^)]*\)|<img\b[^>]*\bsrc\s*=\s*["\']([^"\']+)["\']', re.I)
+TEX_IMAGE = re.compile(r'\\includegraphics\s*(?:\[[^\]]*\]\s*)?\{([^}]+)\}')
+TEX_PATHS = re.compile(r'\\graphicspath\s*\{((?:\s*\{[^}]*\})+)\s*\}')
 
 
 # ---------------------------------------------------------------- files
@@ -105,6 +120,12 @@ def write_json(path, data):
     with open(tmp, 'w', encoding='utf-8') as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
         f.write('\n')
+    os.replace(tmp, path)
+
+
+def write_bytes(path, data):
+    tmp = path.with_name(path.name + '.tmp')
+    tmp.write_bytes(data)
     os.replace(tmp, path)
 
 
@@ -154,10 +175,28 @@ def item_id(path):
     return hashlib.sha1(str(path).encode('utf-8')).hexdigest()[:12]
 
 
-def safe_pdf_name(name):
+def safe_file_name(name):
+    """A plain name for the copy in the item folder: .pdf unless the name has a text extension."""
     name = Path(str(name).replace('\\', '/')).name
+    ext = Path(name).suffix.lower()
     stem = re.sub(r'[^A-Za-z0-9._-]+', '_', Path(name).stem).strip('._-') or 'document'
-    return stem[:120] + '.pdf'
+    return stem[:120] + (ext if ext in TEXT_EXT else '.pdf')
+
+
+def is_text_name(name):
+    return Path(str(name).replace('\\', '/')).suffix.lower() in TEXT_EXT
+
+
+def decode_text(data):
+    """The text of a queued or edited file. ValueError if it is too long, binary, or not UTF-8."""
+    if len(data) > MAX_TEXT:
+        raise ValueError('a text file can be at most %d MB' % (MAX_TEXT // (1024 * 1024)))
+    if data.startswith(b'%PDF-') or b'\0' in data:
+        raise ValueError('that is not a text file')
+    try:
+        return data.decode('utf-8')
+    except UnicodeDecodeError:
+        raise ValueError('a text file must be UTF-8')
 
 
 def name_version(name):
@@ -172,7 +211,7 @@ def name_version(name):
 
 def doc_version(req):
     """An item's document and version: request.json's doc and version where set, else from the PDF's name."""
-    doc, version = name_version(req.get('pdf') or '')
+    doc, version = name_version(req.get('pdf') or req.get('text') or '')
     if str(req.get('doc') or '').strip():
         doc = str(req['doc']).strip()
     if req.get('version') not in (None, ''):
@@ -183,10 +222,10 @@ def doc_version(req):
     return doc, version
 
 
-def make_item(folder, pdf_name, data, meta):
-    """Create <folder>/review_queue/<date>_<stem>/ holding the PDF and request.json."""
-    pdf_name = safe_pdf_name(pdf_name)
-    base = Path(folder) / QUEUE / ('%s_%s' % (dt.date.today().isoformat(), Path(pdf_name).stem))
+def make_item(folder, file_name, data, meta):
+    """Create <folder>/review_queue/<date>_<stem>/ holding the PDF or text file and request.json."""
+    file_name = safe_file_name(file_name)
+    base = Path(folder) / QUEUE / ('%s_%s' % (dt.date.today().isoformat(), Path(file_name).stem))
     item, k = base, 2
     while True:
         try:
@@ -195,9 +234,10 @@ def make_item(folder, pdf_name, data, meta):
         except FileExistsError:
             item = base.with_name('%s-%d' % (base.name, k))
             k += 1
-    (item / pdf_name).write_bytes(data)
-    req = {'title': meta.get('title') or Path(pdf_name).stem, 'note': meta.get('note') or '',
-           'pdf': pdf_name, 'sha256': sha256_bytes(data), 'source': meta.get('source') or pdf_name,
+    (item / file_name).write_bytes(data)
+    req = {'title': meta.get('title') or Path(file_name).stem, 'note': meta.get('note') or '',
+           'text' if is_text_name(file_name) else 'pdf': file_name,
+           'sha256': sha256_bytes(data), 'source': meta.get('source') or file_name,
            'queued_by': meta.get('by') or '', 'queued_at': now()}
     if meta.get('group'):
         req['group'] = meta['group']
@@ -217,6 +257,90 @@ def load_highlights(item):
             'highlights': hs}
 
 
+def no_tex_comments(text):
+    return '\n'.join(re.sub(r'(^|[^\\])%.*$', r'\1', line) for line in text.split('\n'))
+
+
+def image_refs(name, text):
+    """The images a text file refers to, in the order of the text, without repeats, data: or web addresses."""
+    ext = Path(str(name)).suffix.lower()
+    if ext == '.tex':
+        refs = TEX_IMAGE.findall(no_tex_comments(text))
+    elif ext in ('.md', '.markdown'):
+        refs = [a or b for a, b in MD_IMAGE.findall(text)]
+    else:
+        refs = []
+    return [r for r in dict.fromkeys(x.strip() for x in refs) if not re.match(r'^(data:|https?://)', r, re.I)]
+
+
+def find_images(path, text):
+    """[(reference, file or None)] for a text file on disk. Only files in its folder or git repository count,
+    so a reference cannot pull in anything else from the machine."""
+    path = Path(path).expanduser().resolve()
+    limit = git_root(path) or path.parent
+    dirs = [path.parent]
+    if path.suffix.lower() == '.tex':
+        found = TEX_PATHS.search(no_tex_comments(text))
+        dirs += [path.parent / d for d in re.findall(r'\{([^}]*)\}', found.group(1))] if found else []
+    out = []
+    for ref in image_refs(path, text):
+        name = urllib.parse.unquote(ref)
+        tries = [d / (name + ext) for d in dirs for ext in ['', '.pdf', '.png', '.jpg', '.jpeg', '.svg']]
+        hit = None
+        for t in tries:
+            try:
+                t = t.resolve()
+                t.relative_to(limit)
+            except (ValueError, OSError):
+                continue
+            if t.suffix.lower() in IMAGE_TYPES and t.is_file() and t.stat().st_size <= MAX_IMAGE:
+                hit = t
+                break
+        out.append((ref, hit))
+    return out
+
+
+def add_image(item, ref, file_name, data):
+    """Keep an image for a reference in the text, in <item>/images/. Returns {reference: file name}."""
+    ext = Path(str(file_name).replace('\\', '/')).suffix.lower()
+    if ext not in IMAGE_TYPES:
+        raise ValueError('an image must be .png, .jpg, .gif, .webp, .svg, or .pdf')
+    if not data or len(data) > MAX_IMAGE:
+        raise ValueError('an image can be at most %d MB' % (MAX_IMAGE // (1024 * 1024)))
+    if not ref or len(ref) > 1000:
+        raise ValueError('which image in the text is this?')
+    req = read_json(item / 'request.json', {}) or {}
+    images = req.get('images') or {}
+    stem = re.sub(r'[^A-Za-z0-9._-]+', '_', Path(str(file_name).replace('\\', '/')).stem).strip('._-') or 'image'
+    name = '%03d_%s%s' % (len(images) + 1, stem[:60], ext)
+    if Path(images.get(ref, '')).suffix == ext:
+        name = images[ref]
+    (item / 'images').mkdir(exist_ok=True)
+    write_bytes(item / 'images' / name, data)
+    images[ref] = name
+    req['images'] = images
+    write_json(item / 'request.json', req)
+    return images
+
+
+def has_edits(item):
+    d = item / 'edited'
+    return d.is_dir() and any(d.iterdir())
+
+
+def text_state(item, req):
+    """A text item: its file as queued, the file with the reviewer's edits, and a diff between them."""
+    name = Path(req['text']).name
+    original = (item / name).read_bytes()
+    edited = item / 'edited' / name
+    current = edited.read_bytes() if edited.is_file() else original
+    a, b = original.decode('utf-8'), current.decode('utf-8')
+    diff = '\n'.join(difflib.unified_diff(a.split('\n'), b.split('\n'), name, 'edited/' + name, lineterm=''))
+    return {'name': name, 'original': a, 'current': b, 'edited': current != original, 'sha256': sha256_bytes(current),
+            'updated_at': dt.datetime.fromtimestamp(edited.stat().st_mtime).astimezone().isoformat(timespec='seconds')
+            if edited.is_file() else None, 'diff': diff, 'images': req.get('images') or {}}
+
+
 def summary(root, item):
     req = read_json(item / 'request.json', {}) or {}
     hs = load_highlights(item)['highlights']
@@ -234,7 +358,8 @@ def summary(root, item):
         'title': req.get('title') or item.name, 'note': req.get('note', ''),
         'queued_by': req.get('queued_by', ''), 'queued_at': req.get('queued_at', ''),
         'pdf': req.get('pdf', ''), 'sha256': req.get('sha256', ''), 'source': req.get('source', ''),
-        'doc': doc, 'version': version,
+        'kind': 'text' if req.get('text') else 'pdf', 'file': req.get('text') or req.get('pdf', ''),
+        'edited': has_edits(item), 'doc': doc, 'version': version,
         # "done" means the reviewer finished it; "superseded" means a newer version replaced it.
         'status': 'waiting' if done is None else 'superseded' if replaced.get('superseded_by') else 'done',
         'done_at': replaced.get('done_at'),
@@ -307,15 +432,16 @@ def clock(seconds):
     return '%d:%02d' % (s // 60, s % 60)
 
 
-def format_review(s, highlights, path=None, texts=None):
-    """The numbered highlights of one item, with notes and transcribed voice notes, as Markdown."""
+def format_review(s, highlights, path=None, texts=None, text=None):
+    """One item as Markdown: its numbered highlights, with notes and transcribed voice notes, or for a
+    text file the diff of the reviewer's edits."""
     one = lambda t: ' '.join(str(t).split())
     texts = texts or {}
     hl = sorted(highlights, key=lambda h: h.get('n', 0))
     out = ['# Review: %s' % s['title'], '']
     if path:
         out.append('- Item: %s' % path)
-    out.append('- File: %s (sha256 %s), from %s' % (s['pdf'], (s['sha256'] or '')[:12], s['source'] or 'unknown'))
+    out.append('- File: %s (sha256 %s), from %s' % (s.get('file') or s['pdf'], (s['sha256'] or '')[:12], s['source'] or 'unknown'))
     out.append('- Document: %s, %s.' % (s.get('doc'), version_label(s.get('version'))))
     if s.get('note'):
         out.append('- Note to the reviewer: %s' % one(s['note']))
@@ -328,6 +454,12 @@ def format_review(s, highlights, path=None, texts=None):
                       'closed automatically' if s.get('superseded_auto') else 'closed by the reviewer'))
     else:
         out.append('- Not marked done yet.')
+    if text is not None:
+        if not text['edited']:
+            out.append('- No edits.')
+            return '\n'.join(out)
+        out.append('- Edited %s; the full text is at edited/%s in the item folder.' % (text['updated_at'], text['name']))
+        return '\n'.join(out + ['', '```diff', text['diff'], '```'])
     out.append('- %d highlights: %d change, %d discuss. Numbers follow the order they were made.'
                % (s['count'], s['change'], s['discuss']))
     out.append('')
@@ -367,12 +499,24 @@ def status_label(s):
     return 'superseded by %s' % ('a newer version' if v is None else 'v%s' % v)
 
 
+def marks_label(s):
+    """"  3 highlights", or for a text file whether it has been edited."""
+    if s.get('kind') == 'text':
+        return 'text, edited' if s.get('edited') else 'text, no edits'
+    return '%3d highlights' % s['count']
+
+
 # ---------------------------------------------------------------- local commands
 
 def cmd_queue(a):
     pdf = Path(a.file).expanduser().resolve()
-    if not pdf.is_file() or pdf.suffix.lower() != '.pdf':
-        sys.exit('Not a PDF file: %s' % pdf)
+    if not pdf.is_file() or not (pdf.suffix.lower() == '.pdf' or is_text_name(pdf)):
+        sys.exit('Not a PDF or a .txt, .md, or .tex file: %s' % pdf)
+    if is_text_name(pdf):
+        try:
+            decode_text(pdf.read_bytes())
+        except ValueError as e:
+            sys.exit('%s: %s' % (pdf, e))
     if a.into:
         folder = Path(a.into).expanduser().resolve()
     else:
@@ -381,6 +525,12 @@ def cmd_queue(a):
     item = make_item(folder, pdf.name, pdf.read_bytes(), {
         'title': a.title, 'note': a.note, 'by': a.by, 'doc': (a.doc or '').strip(), 'version': a.version,
         'source': str(pdf.relative_to(root)) if root else str(pdf)})
+    if is_text_name(pdf):
+        for ref, found in find_images(pdf, pdf.read_text(encoding='utf-8')):
+            if found:
+                add_image(item, ref, found.name, found.read_bytes())
+            else:
+                print('Image not found, so not queued: %s' % ref, file=sys.stderr)
     print(item)
 
 
@@ -390,8 +540,8 @@ def cmd_list(a):
     if not rows:
         print('No review items.' if a.all else 'Nothing waiting.')
     for s in rows:
-        print('%-7s  %3d highlights  %s\n         %s, %s\n         %s'
-              % (status_label(s), s['count'], s['title'], s['doc'], version_label(s['version']), s['path']))
+        print('%-7s  %s  %s\n         %s, %s\n         %s'
+              % (status_label(s), marks_label(s), s['title'], s['doc'], version_label(s['version']), s['path']))
 
 
 def resolve_item(arg, roots):
@@ -415,11 +565,13 @@ def cmd_show(a):
     root, item = resolve_item(a.item, roots_from(a.root))
     s = summary(root, item)
     hl = load_highlights(item)['highlights']
+    req = read_json(item / 'request.json', {}) or {}
+    text = text_state(item, req) if req.get('text') else None
     if a.json:
-        print(json.dumps({'item': s, 'request': read_json(item / 'request.json', {}), 'done': read_json(item / 'done.json'),
-                          'highlights': hl, 'transcripts': transcripts(item)}, indent=2, ensure_ascii=False))
+        print(json.dumps({'item': s, 'request': req, 'done': read_json(item / 'done.json'),
+                          'highlights': hl, 'transcripts': transcripts(item), 'text': text}, indent=2, ensure_ascii=False))
     else:
-        print(format_review(s, hl, item, transcripts(item)))
+        print(format_review(s, hl, item, transcripts(item), text))
 
 
 # ---------------------------------------------------------------- remote commands
@@ -447,14 +599,28 @@ def http_call(url, data=None, method='GET', ctype=None):
 def cmd_push(a):
     pdf = Path(a.file).expanduser()
     data = pdf.read_bytes()
-    if not data.startswith(b'%PDF-'):
-        sys.exit('Not a PDF file: %s' % pdf)
+    if is_text_name(pdf):
+        try:
+            decode_text(data)
+        except ValueError as e:
+            sys.exit('%s: %s' % (pdf, e))
+    elif not data.startswith(b'%PDF-'):
+        sys.exit('Not a PDF or a .txt, .md, or .tex file: %s' % pdf)
     q = urllib.parse.urlencode({'title': a.title, 'note': a.note or '', 'by': a.by or '', 'group': a.group or '',
                                 'doc': a.doc or '', 'version': '' if a.version is None else a.version,
                                 'filename': pdf.name})
     item = http_call(a.server.rstrip('/') + '/api/queue?' + q, data, 'POST', 'application/pdf')['item']
     print('Queued "%s" (id %s, %d KB; document %s, %s).'
           % (item['title'], item['id'], len(data) // 1024, item.get('doc'), version_label(item.get('version'))))
+    if is_text_name(pdf):
+        for ref, found in find_images(pdf, data.decode('utf-8')):
+            if found:
+                q = urllib.parse.urlencode({'ref': ref, 'filename': found.name})
+                http_call(a.server.rstrip('/') + '/api/items/%s/images?%s' % (item['id'], q), found.read_bytes(), 'POST',
+                          'application/octet-stream')
+                print('Sent image %s.' % ref)
+            else:
+                print('Image not found, so not sent: %s' % ref, file=sys.stderr)
 
 
 def cmd_pull(a):
@@ -462,8 +628,8 @@ def cmd_pull(a):
     items = http_call(base + '/api/items')['items']
     if not a.item:
         for s in items:
-            print('%-7s  %3d highlights  %s  [%s, id %s]\n         %s, %s'
-                  % (status_label(s), s['count'], s['title'], s['folder'], s['id'],
+            print('%-7s  %s  %s  [%s, id %s]\n         %s, %s'
+                  % (status_label(s), marks_label(s), s['title'], s['folder'], s['id'],
                      s.get('doc'), version_label(s.get('version'))))
         return
     words = a.item.lower()
@@ -476,7 +642,7 @@ def cmd_pull(a):
     if a.json:
         print(json.dumps(d, indent=2, ensure_ascii=False))
     else:
-        print(format_review(d['item'], d['highlights']['highlights'], texts=d.get('transcripts')))
+        print(format_review(d['item'], d['highlights']['highlights'], texts=d.get('transcripts'), text=d.get('text')))
 
 
 # ---------------------------------------------------------------- voice notes
@@ -610,18 +776,18 @@ class Store:
 
     def supersede(self, iid, item, newer, automatic):
         """Close an item as replaced by `newer` (a summary): done.json with superseded_by. Nothing else in
-        the folder changes. Closing automatically needs a waiting item without highlights or voice notes;
+        the folder changes. Closing automatically needs a waiting item without highlights, voice notes, or edits;
         closing by hand needs one the reviewer has not marked done. Returns whether it closed the item."""
         with self.item_lock(iid):
             done = read_json(item / 'done.json', None)
             hs = load_highlights(item)['highlights']
-            if automatic and (done is not None or hs or audio_files(item)):
+            if automatic and (done is not None or hs or audio_files(item) or has_edits(item)):
                 return False
             if done is not None and not (isinstance(done, dict) and done.get('superseded_by')):
                 return False
             write_json(item / 'done.json', {
                 'superseded_by': newer['id'], 'superseded_version': newer['version'], 'superseded_at': now(),
-                'automatic': bool(automatic), 'count': len(hs),
+                'automatic': bool(automatic), 'edited': has_edits(item), 'count': len(hs),
                 'change': sum(1 for h in hs if h.get('tag') == 'change'),
                 'discuss': sum(1 for h in hs if h.get('tag') == 'discuss')})
         with self.state_lock:
@@ -635,7 +801,7 @@ class Store:
         return True
 
     def sweep(self):
-        """Rescan, then close each older waiting version that has no highlights and no voice notes once a
+        """Rescan, then close each older waiting version that has no highlights, voice notes, or edits once a
         higher version of its document is queued. Returns [(closed item, newer item)] as summaries."""
         with self.sweeping:
             items = self.all(fresh=True)
@@ -653,7 +819,7 @@ class Store:
                 t = top.get(s['doc']) if s['version'] is not None else None
                 if not t or s['status'] != 'waiting' or s['version'] >= t['version']:
                     continue
-                if s['count'] or s['voice_notes']:
+                if s['count'] or s['voice_notes'] or s['edited']:
                     continue                                 # the reviewer has marked it, so only they close it
                 if self.replaced.get(s['id'], {}).get('version', -1) >= t['version']:
                     continue                                 # reopened since this server closed it
@@ -750,7 +916,7 @@ def make_handler(store, token):
             ctype = mimetypes.guess_type(str(p))[0] or 'application/octet-stream'
             if ctype.startswith('text/') or ctype.endswith('javascript') or ctype.endswith('json'):
                 ctype += '; charset=utf-8'
-            cache = {'Cache-Control': 'max-age=86400'} if '/pdfjs/' in str(p) else None
+            cache = {'Cache-Control': 'max-age=86400'} if '/pdfjs/' in str(p) or '/codemirror/' in str(p) else None
             self.reply(200, p.read_bytes(), ctype, cache)
 
         def item(self, parts):
@@ -759,7 +925,7 @@ def make_handler(store, token):
                 self.json_reply(404, {'error': 'no such item; it may have moved'})
             return found
 
-        def send_file(self, path, ctype):
+        def send_file(self, path, ctype, headers=None):
             """Send a file, honoring a byte range: Safari plays audio only from servers that do."""
             size = path.stat().st_size
             rng = self.headers.get('Range', '')
@@ -778,9 +944,9 @@ def make_handler(store, token):
                 with open(path, 'rb') as f:
                     f.seek(start)
                     data = f.read(end - start + 1)
-                return self.reply(206, data, ctype, {'Content-Range': 'bytes %d-%d/%d' % (start, end, size),
-                                                     'Accept-Ranges': 'bytes'})
-            self.reply(200, path.read_bytes(), ctype, {'Accept-Ranges': 'bytes'})
+                return self.reply(206, data, ctype, dict({'Content-Range': 'bytes %d-%d/%d' % (start, end, size),
+                                                          'Accept-Ranges': 'bytes'}, **(headers or {})))
+            self.reply(200, path.read_bytes(), ctype, dict({'Accept-Ranges': 'bytes'}, **(headers or {})))
 
         def clip(self, item, name):
             if not SAFE_FILE.match(name) or Path(name).suffix not in EXT_TYPE:
@@ -808,16 +974,29 @@ def make_handler(store, token):
             if not found:
                 return
             root, item = found
+            req = read_json(item / 'request.json', {}) or {}
             if len(parts) == 3:
-                return self.json_reply(200, {'item': summary(root, item), 'request': read_json(item / 'request.json', {}),
-                                             'highlights': load_highlights(item), 'done': read_json(item / 'done.json'),
-                                             'transcripts': transcripts(item), 'transcribe': store.transcriber.ok})
+                reply = {'item': summary(root, item), 'request': req,
+                         'highlights': load_highlights(item), 'done': read_json(item / 'done.json'),
+                         'transcripts': transcripts(item), 'transcribe': store.transcriber.ok}
+                if req.get('text'):
+                    reply['text'] = text_state(item, req)
+                return self.json_reply(200, reply)
             if parts[3:] == ['file']:
-                name = Path((read_json(item / 'request.json', {}) or {}).get('pdf', '')).name
+                name = Path(req.get('text') or req.get('pdf', '')).name
                 f = item / name
                 if not name or not f.is_file():
-                    return self.json_reply(404, {'error': 'the PDF is missing from the item folder'})
-                return self.send_file(f, 'application/pdf')
+                    return self.json_reply(404, {'error': 'the file is missing from the item folder'})
+                return self.send_file(f, 'text/plain; charset=utf-8' if req.get('text') else 'application/pdf')
+            if len(parts) == 5 and parts[3] == 'images':
+                ext = Path(parts[4]).suffix.lower()
+                p = item / 'images' / parts[4]
+                if not SAFE_FILE.match(parts[4]) or ext not in IMAGE_TYPES or not p.is_file():
+                    return self.json_reply(404, {'error': 'no such image'})
+                # An SVG opened by itself could run scripts on this site; a sandbox stops that.
+                return self.send_file(p, IMAGE_TYPES[ext], {'Content-Security-Policy': 'sandbox; default-src \'none\'; '
+                                                            'style-src \'unsafe-inline\'; img-src data:'}
+                                      if ext == '.svg' else None)
             if parts[3:] == ['transcripts']:
                 return self.json_reply(200, {'transcripts': transcripts(item), 'transcribe': store.transcriber.ok})
             if len(parts) == 5 and parts[3] == 'audio':
@@ -831,12 +1010,14 @@ def make_handler(store, token):
             parts = self.route()
             if parts is None:
                 return
-            if parts[:2] != ['api', 'items'] or parts[3:] != ['highlights']:
+            if parts[:2] != ['api', 'items'] or parts[3:] not in (['highlights'], ['text']):
                 return self.json_reply(404, {'error': 'not found'})
             found = self.item(parts)
             if not found:
                 return
             root, item = found
+            if parts[3] == 'text':
+                return self.save_text(root, item, parts[2])
             try:
                 data = self.body()
                 highlights = clean_highlights(data.get('highlights'))
@@ -853,13 +1034,44 @@ def make_handler(store, token):
                 write_json(item / 'highlights.json', new)
             self.json_reply(200, {'highlights': new, 'item': summary(root, item)})
 
+        def save_text(self, root, item, iid):
+            """Save the reviewer's edits, unless the file changed since this page read it. The file as queued
+            is never changed, and text the same as it means no edits."""
+            req = read_json(item / 'request.json', {}) or {}
+            if not req.get('text'):
+                return self.json_reply(400, {'error': 'this item is not a text file'})
+            try:
+                data = self.body()
+                if not isinstance(data.get('text'), str):
+                    raise ValueError('text must be a string')
+                body = data['text'].encode('utf-8')
+                decode_text(body)
+            except ValueError as e:
+                return self.json_reply(400, {'error': str(e)})
+            name = Path(req['text']).name
+            with store.item_lock(iid):
+                state = text_state(item, req)
+                if str(data.get('base_sha256')) != state['sha256']:
+                    return self.json_reply(409, {'error': 'changed on another device', 'text': state})
+                edited = item / 'edited' / name
+                if body == (item / name).read_bytes():
+                    if edited.exists():
+                        edited.unlink()
+                        edited.parent.rmdir()
+                else:
+                    edited.parent.mkdir(exist_ok=True)
+                    write_bytes(edited, body)
+            state = text_state(item, req)
+            self.json_reply(200, {'text': {k: state[k] for k in ('edited', 'sha256', 'updated_at')},
+                                  'item': summary(root, item)})
+
         def do_POST(self):
             parts = self.route()
             if parts is None:
                 return
             if parts == ['api', 'queue']:
                 return self.upload()
-            if parts[:2] != ['api', 'items'] or parts[3:] not in (['done'], ['audio']):
+            if parts[:2] != ['api', 'items'] or parts[3:] not in (['done'], ['audio'], ['images']):
                 return self.json_reply(404, {'error': 'not found'})
             found = self.item(parts)
             if not found:
@@ -867,6 +1079,17 @@ def make_handler(store, token):
             root, item = found
             if parts[3] == 'audio':
                 return self.add_clip(item)
+            if parts[3] == 'images':
+                req = read_json(item / 'request.json', {}) or {}
+                if not req.get('text'):
+                    return self.json_reply(400, {'error': 'this item is not a text file'})
+                get = lambda k: (self._query.get(k, ['']) or [''])[0]
+                try:
+                    with store.item_lock(parts[2]):
+                        images = add_image(item, get('ref'), get('filename'), self._body)
+                except ValueError as e:
+                    return self.json_reply(400, {'error': str(e)})
+                return self.json_reply(200, {'images': images})
             try:
                 newer = self.body().get('superseded_by')
             except ValueError:
@@ -876,7 +1099,7 @@ def make_handler(store, token):
             with store.item_lock(parts[2]):
                 hs = load_highlights(item)['highlights']
                 write_json(item / 'done.json', {
-                    'done_at': now(), 'count': len(hs),
+                    'done_at': now(), 'edited': has_edits(item), 'count': len(hs),
                     'change': sum(1 for h in hs if h.get('tag') == 'change'),
                     'discuss': sum(1 for h in hs if h.get('tag') == 'discuss')})
             self.json_reply(200, {'item': summary(root, item)})
@@ -896,12 +1119,17 @@ def make_handler(store, token):
         def upload(self):
             if not store.inbox:
                 return self.json_reply(400, {'error': 'this server has no inbox; start it with --inbox FOLDER'})
-            if not self._body.startswith(b'%PDF-'):
-                return self.json_reply(400, {'error': 'that is not a PDF'})
             get = lambda k: (self._query.get(k, ['']) or [''])[0].strip()[:2000]
             if get('version') and not re.match(r'^[0-9]{1,9}$', get('version')):
                 return self.json_reply(400, {'error': 'version must be a whole number'})
             name = get('filename') or 'document.pdf'
+            if is_text_name(name):
+                try:
+                    decode_text(self._body)
+                except ValueError as e:
+                    return self.json_reply(400, {'error': str(e)})
+            elif not self._body.startswith(b'%PDF-'):
+                return self.json_reply(400, {'error': 'send a PDF, or a .txt, .md, or .tex file'})
             item = make_item(store.inbox, name, self._body, {
                 'title': get('title'), 'note': get('note'), 'by': get('by'), 'group': get('group')[:80],
                 'doc': get('doc')[:200], 'version': int(get('version')) if get('version') else None,
@@ -1034,7 +1262,7 @@ def cmd_serve(a):
     else:
         print('Older versions are not closed automatically (--no-auto-close).')
     if inbox:
-        print('PDFs sent with push or Add PDF go to %s.' % inbox)
+        print('Files sent with push or Add file go to %s.' % inbox)
     if transcriber.ok:
         todo = [p for _, i in items for p in audio_files(i) if not p.with_name(p.name + '.json').exists()]
         for p in todo:
@@ -1057,9 +1285,9 @@ def cmd_serve(a):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description='Review queue for PDFs marked up on an iPad.')
+    ap = argparse.ArgumentParser(description='Review queue for PDFs marked up on an iPad, and text files to edit.')
     sub = ap.add_subparsers(dest='cmd')
-    q = sub.add_parser('queue', help='queue a PDF for review (on the machine that holds the files)')
+    q = sub.add_parser('queue', help='queue a PDF or text file for review (on the machine that holds the files)')
     q.add_argument('file')
     q.add_argument('--title', required=True)
     q.add_argument('--note', help='what the reviewer should look at')
@@ -1076,7 +1304,7 @@ def main(argv=None):
     sh.add_argument('--json', action='store_true')
     sv = sub.add_parser('serve', help='run the web page')
     sv.add_argument('--root', action='append')
-    sv.add_argument('--inbox', help='folder for PDFs sent with push or the Add PDF button (also shown in the queue)')
+    sv.add_argument('--inbox', help='folder for files sent with push or the Add file button (also shown in the queue)')
     sv.add_argument('--lan', action='store_true', help='also listen on the local network, with a token')
     sv.add_argument('--host', default='127.0.0.1', help='address to listen on (default: this computer only)')
     sv.add_argument('--port', type=int, default=8765)
@@ -1084,7 +1312,7 @@ def main(argv=None):
                     help='do not close older waiting versions when a newer version is queued')
     sv.add_argument('--state', help='where to remember the items closed as replaced '
                                     '(default ~/.config/review-server/replaced.json)')
-    pu = sub.add_parser('push', help='send a PDF to a review server\'s inbox')
+    pu = sub.add_parser('push', help='send a PDF or text file to a review server\'s inbox')
     pu.add_argument('file')
     pu.add_argument('--server', required=True, help='for example https://<machine>.<tailnet>.ts.net')
     pu.add_argument('--title', required=True)

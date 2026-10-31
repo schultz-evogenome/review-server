@@ -1,4 +1,4 @@
-/* Review queue: list of PDFs waiting for markup, and a viewer for highlighting them.
+/* Review queue: list of PDFs waiting for markup, a viewer for highlighting them, and an editor for text files.
    Highlights are stored in PDF points from the top-left corner of each page. */
 'use strict';
 (function () {
@@ -66,10 +66,32 @@
   }
   const newId = () => 'h' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 
+  // ------------------------------------------------------------ theme
+
+  const THEMES = ['auto', 'dark', 'light'], THEME_LABEL = { auto: 'Theme: auto', dark: 'Theme: dark', light: 'Theme: light' };
+  function showTheme() {
+    let t = 'auto';
+    try { t = localStorage.getItem('review.theme') || 'auto'; } catch (e) { /* follows the device */ }
+    if (t === 'auto') delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme = t;
+    $('#themeBtn').textContent = THEME_LABEL[t] || THEME_LABEL.auto;
+    return t;
+  }
+  $('#themeBtn').addEventListener('click', () => {
+    const next = THEMES[(THEMES.indexOf(showTheme()) + 1) % THEMES.length];
+    try { localStorage.setItem('review.theme', next); } catch (e) { /* this page only */ }
+    if (next === 'auto') delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme = next;
+    $('#themeBtn').textContent = THEME_LABEL[next];
+  });
+  showTheme();
+
   // ------------------------------------------------------------ routing
 
   window.addEventListener('hashchange', route);
-  $('#back').addEventListener('click', async () => { await flush(); location.hash = '#/'; });
+  $('#back').addEventListener('click', async () => {
+    await flush();
+    if (T.cm && (T.conflict || T.dirty)) { toast(T.conflict ? 'Choose a version first' : 'Your edits are not saved yet; try again in a moment', 4000); return; }
+    location.hash = '#/';
+  });
   $('#refresh').addEventListener('click', () => showQueue());
 
   function route() {
@@ -83,7 +105,7 @@
     await flush();
     teardown();
     S.item = null;
-    $('#viewer').hidden = true; $('#queue').hidden = false;
+    $('#viewer').hidden = true; $('#queue').hidden = false; $('#brief').hidden = true;
     $('#tools').hidden = true; $('#back').hidden = true; $('#doneBtn').hidden = true; $('#refresh').hidden = false;
     $('#addBtn').hidden = true;
     $('#title').textContent = 'Review queue'; document.title = 'Review queue'; setStatus('');
@@ -112,7 +134,7 @@
       (i.status === 'done' ? ' &middot; done ' + esc(fmtTime(i.done_at)) : '') +
       (i.status === 'superseded' ? ' &middot; ' + replacedBy(i) : '') + '</div>' +
       (i.note ? '<div class="card-note">' + esc(i.note) + '</div>' : '') +
-      '<div class="card-counts">' + (i.count ? i.count + ' highlight' + (i.count === 1 ? '' : 's') + ': ' + i.change + ' change, ' + i.discuss + ' discuss' : 'No highlights yet') + '</div>' +
+      '<div class="card-counts">' + (i.kind === 'text' ? (i.edited ? 'Text file, edited' : 'Text file, no edits yet') : i.count ? i.count + ' highlight' + (i.count === 1 ? '' : 's') + ': ' + i.change + ' change, ' + i.discuss + ' discuss' : 'No highlights yet') + '</div>' +
       '</a>' + (older && older.length ? olderBlock(older) : '') + '</div>';
     Q.cards = new Map(cards.map(c => [c.item.id, c]));
     q.innerHTML = '<h2>Waiting <span class="count">' + cards.length + '</span></h2>' +
@@ -126,8 +148,9 @@
   // ------------------------------------------------------------ versions of one document
 
   const Q = { cards: new Map() };   // waiting card id -> {item, older}
-  const marks = i => (i.count ? i.count + ' highlight' + (i.count === 1 ? '' : 's') : '') +
-    (i.count && i.voice_notes ? ', ' : '') + (i.voice_notes ? i.voice_notes + ' voice note' + (i.voice_notes === 1 ? '' : 's') : '');
+  const marks = i => [i.count ? i.count + ' highlight' + (i.count === 1 ? '' : 's') : '',
+    i.voice_notes ? i.voice_notes + ' voice note' + (i.voice_notes === 1 ? '' : 's') : '',
+    i.edited ? 'your edits' : ''].filter(Boolean).join(', ');
 
   // One card per document: its newest waiting version, carrying the older waiting versions. An item without
   // a version is a document of its own, and items with the same version stay separate cards.
@@ -152,7 +175,7 @@
       '<button class="older-toggle" aria-expanded="false">' + older.length + ' older version' + (older.length === 1 ? '' : 's') + '</button>' +
       '<button class="older-done">Mark older done</button></div>' +
       '<div class="older-list" hidden>' + older.map(i => '<a href="#/item/' + i.id + '"><b>v' + i.version + '</b> ' + esc(i.title) +
-        '<span class="muted"> &middot; queued ' + esc(fmtTime(i.queued_at)) + ' &middot; ' + (marks(i) || 'No highlights') + '</span></a>').join('') + '</div>' +
+        '<span class="muted"> &middot; queued ' + esc(fmtTime(i.queued_at)) + ' &middot; ' + (marks(i) || (i.kind === 'text' ? 'No edits' : 'No highlights')) + '</span></a>').join('') + '</div>' +
       '<div class="older-ask" hidden></div></div>';
   }
 
@@ -167,9 +190,9 @@
       list.hidden = !list.hidden;
       b.setAttribute('aria-expanded', String(!list.hidden));
     } else if (b.classList.contains('older-done')) {
-      const marked = c.older.filter(i => i.count || i.voice_notes), plain = c.older.filter(i => !i.count && !i.voice_notes);
+      const marked = c.older.filter(i => marks(i)), plain = c.older.filter(i => !marks(i));
       if (!marked.length) { closeOlder(c.item, c.older); return; }
-      ask.innerHTML = '<p>' + (marked.length === 1 ? 'This older version has' : 'These older versions have') + ' your highlights or voice notes:</p>' +
+      ask.innerHTML = '<p>' + (marked.length === 1 ? 'This older version has' : 'These older versions have') + ' your highlights, voice notes, or edits:</p>' +
         '<ul>' + marked.map(i => '<li><b>v' + i.version + '</b> ' + esc(i.title) + ' <span class="muted">(' + marks(i) + ')</span></li>').join('') + '</ul>' +
         '<p>Close ' + (marked.length === 1 ? 'it' : 'them') + ' too? Closed versions go to Replaced, not Done, and Reopen brings them back.</p>' +
         '<div class="row"><button data-close="none">Cancel</button>' +
@@ -179,7 +202,7 @@
     } else if (b.dataset.close) {
       ask.hidden = true;
       if (b.dataset.close === 'all') closeOlder(c.item, c.older);
-      else if (b.dataset.close === 'plain') closeOlder(c.item, c.older.filter(i => !i.count && !i.voice_notes));
+      else if (b.dataset.close === 'plain') closeOlder(c.item, c.older.filter(i => !marks(i)));
     }
   });
 
@@ -204,7 +227,7 @@
     if (!f) return;
     pendingFile = f;
     $('#addName').textContent = f.name + ' (' + Math.max(1, Math.round(f.size / 1024)) + ' KB)';
-    $('#addTitle').value = f.name.replace(/\.pdf$/i, '').replace(/_+/g, ' ');
+    $('#addTitle').value = f.name.replace(/\.(pdf|txt|md|markdown|tex)$/i, '').replace(/_+/g, ' ');
     $('#addNote').value = '';
     $('#addPanel').hidden = false;
   });
@@ -216,7 +239,7 @@
     const q = new URLSearchParams({ title: $('#addTitle').value.trim() || pendingFile.name, note: $('#addNote').value.trim(), filename: pendingFile.name });
     go.disabled = true; go.textContent = 'Sending…';
     try {
-      const r = await fetch('/api/queue?' + q.toString(), { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/pdf', 'X-Review': '1' }, body: pendingFile });
+      const r = await fetch('/api/queue?' + q.toString(), { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': pendingFile.type || 'application/octet-stream', 'X-Review': '1' }, body: pendingFile });
       let body = {};
       try { body = await r.json(); } catch (e) { /* not JSON */ }
       if (!r.ok) throw new Error(body.error || r.statusText);
@@ -230,10 +253,414 @@
     }
   });
 
+  // ------------------------------------------------------------ text editor
+
+  const T = {
+    cm: null,
+    sha: '',           // sha256 of the text as last saved
+    original: '',      // the file as queued
+    origLines: [],
+    crlf: false,
+    dirty: false,
+    saving: false,
+    conflict: null,    // the other device's text, until a version is chosen
+    timer: null,
+    refreshTimer: null,
+    marks: [],         // tints on edited text
+    images: {},        // reference in the text -> file in the item's images folder
+    refs: [],          // images in the order of the text: {line, ref, alt, node, widget}
+    imgKey: '',
+    nodes: new Map(),  // figures already built, kept so they need not load again
+    addRef: null,
+  };
+  const CM = '/static/codemirror/';
+  const pref = {
+    get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+    set(k, v) { try { localStorage.setItem(k, v); } catch (e) { /* not remembered */ } },
+  };
+
+  let cmReady = null;
+  function loadEditor() {
+    if (cmReady) return cmReady;
+    ['lib/codemirror.css', 'addon/dialog/dialog.css'].forEach(f => {
+      const l = document.createElement('link');
+      l.rel = 'stylesheet'; l.href = CM + f;
+      document.head.insertBefore(l, $('link[href="/static/app.css"]'));   // app.css keeps the last word
+    });
+    const js = ['lib/codemirror.js', 'addon/search/searchcursor.js', 'addon/dialog/dialog.js', 'addon/edit/matchbrackets.js',
+      'keymap/vim.js', 'mode/markdown/markdown.js', 'mode/stex/stex.js'];
+    cmReady = js.reduce((p, f) => p.then(() => new Promise((ok, no) => {
+      const s = document.createElement('script');
+      s.src = CM + f; s.onload = ok; s.onerror = () => no(new Error('could not load ' + f));
+      document.head.appendChild(s);
+    })), Promise.resolve()).then(() => {
+      CodeMirror.commands.save = () => saveNow();
+      const leave = async () => { await flushText(); if (!T.conflict && !T.dirty) location.hash = '#/'; };
+      CodeMirror.Vim.defineEx('quit', 'q', leave);
+      CodeMirror.Vim.defineEx('wq', 'wq', leave);
+      CodeMirror.Vim.defineEx('xit', 'x', leave);
+    }).catch(e => { cmReady = null; throw e; });
+    return cmReady;
+  }
+
+  async function openText(data, token) {
+    $('#viewer').hidden = true; $('#tools').hidden = true;
+    $('#editor').hidden = false; $('#textTools').hidden = false;
+    document.body.classList.add('writing');
+    $('#editor').innerHTML = '<div class="loading">Loading&hellip;</div>';
+    try { await loadEditor(); }
+    catch (e) { $('#editor').innerHTML = '<div class="loading error">Could not load the editor: ' + esc(e.message) + '</div>'; return; }
+    if (token !== S.loadToken) return;
+    $('#editor').innerHTML = '';
+    const t = data.text, name = t.name.toLowerCase();
+    T.sha = t.sha256; T.original = t.original; T.origLines = t.original.split(/\r\n?|\n/);
+    T.crlf = /\r\n/.test(t.current); T.images = t.images || {};
+    T.conflict = null; T.dirty = false; T.refs = []; T.imgKey = ''; T.nodes = new Map(); T.marks = [];
+    $('#conflict').hidden = true;
+    $('#vimOn').checked = pref.get('review.vim') === '1';
+    T.cm = CodeMirror($('#editor'), {
+      value: t.current,
+      mode: /\.tex$/.test(name) ? 'stex' : /\.(md|markdown)$/.test(name) ? { name: 'markdown', highlightFormatting: true } : null,
+      theme: 'goyo',
+      keyMap: $('#vimOn').checked ? 'vim' : 'default',
+      lineWrapping: true,            // wraps on screen only; the file's line breaks stay as they are
+      viewportMargin: Infinity,      // the page scrolls, not a box inside it
+      cursorScrollMargin: 120,
+      matchBrackets: true,
+      showCursorWhenSelecting: true,
+      spellcheck: true,
+      autocorrect: false,
+      readOnly: S.reopen,
+    });
+    T.cm.on('change', onTextChange);
+    T.cm.on('vim-mode-change', e => showVimMode(e.mode + (e.subMode ? ' ' + e.subMode : '')));
+    showVimMode('normal');
+    refreshChanges(); refreshImages(); updateWords();
+    setStatus(t.edited ? 'Saved' : '');
+    if (!S.reopen && window.matchMedia('(pointer: fine)').matches) T.cm.focus();
+  }
+
+  function closeText() {
+    clearTimeout(T.timer); clearTimeout(T.refreshTimer);
+    T.cm = null; T.dirty = false; T.conflict = null;
+    $('#editor').innerHTML = ''; $('#editor').hidden = true; $('#textTools').hidden = true;
+    $('#imagesPanel').hidden = true; $('#conflict').hidden = true; $('#vimMode').hidden = true;
+    document.body.classList.remove('writing', 'typing');
+  }
+
+  function showVimMode(mode) {
+    const on = !!T.cm && $('#vimOn').checked;
+    $('#vimMode').hidden = !on;
+    if (on) $('#vimMode').textContent = mode;
+  }
+  $('#vimOn').addEventListener('change', e => {
+    pref.set('review.vim', e.target.checked ? '1' : '0');
+    if (!T.cm) return;
+    T.cm.setOption('keyMap', e.target.checked ? 'vim' : 'default');
+    showVimMode('normal');
+    T.cm.focus();
+  });
+
+  // The toolbar slides away while typing and comes back when the pointer or a finger moves.
+  function showBarAgain(e) {
+    if (e.type === 'mousemove' && Math.abs(e.movementX) + Math.abs(e.movementY) < 3) return;
+    document.body.classList.remove('typing');
+  }
+  document.addEventListener('mousemove', showBarAgain);
+  document.addEventListener('touchstart', showBarAgain, { passive: true });
+  $('#editor').addEventListener('click', e => { if (T.cm && e.target === e.currentTarget) T.cm.focus(); });
+
+  function editorText() {
+    const nl = T.cm.getValue('\n');
+    if (nl === T.origLines.join('\n')) return T.original;      // exactly as queued, whatever its line endings
+    return T.crlf ? T.cm.getValue('\r\n') : nl;
+  }
+
+  function onTextChange() {
+    T.dirty = true;
+    setStatus('Not saved yet');
+    document.body.classList.add('typing');
+    clearTimeout(T.timer);
+    T.timer = setTimeout(saveText, 600);
+    clearTimeout(T.refreshTimer);
+    T.refreshTimer = setTimeout(() => { if (T.cm) { refreshChanges(); refreshImages(); updateWords(); } }, 250);
+  }
+
+  function updateWords() {
+    const n = (T.cm.getValue().match(/\S+/g) || []).length;
+    $('#wordCount').textContent = n.toLocaleString() + ' word' + (n === 1 ? '' : 's');
+  }
+
+  async function saveText() {
+    if (!T.cm || T.conflict) return;
+    if (T.saving) { clearTimeout(T.timer); T.timer = setTimeout(saveText, 400); return; }
+    T.saving = true; T.dirty = false; setStatus('Saving…');
+    const id = S.item.id;
+    try {
+      const r = await api('/api/items/' + id + '/text', { method: 'PUT', body: JSON.stringify({ base_sha256: T.sha, text: editorText() }) });
+      T.sha = r.text.sha256;
+      if (S.item && S.item.id === id) S.item = r.item;
+      setStatus(T.dirty ? 'Not saved yet' : 'Saved');
+    } catch (e) {
+      T.dirty = true;
+      if (e.status === 409 && e.body && e.body.text) showConflict(e.body.text);
+      else if (e.status >= 400 && e.status < 500) setStatus('Not saved: ' + e.message);
+      else { setStatus('Not saved; retrying'); clearTimeout(T.timer); T.timer = setTimeout(saveText, 4000); }
+    } finally {
+      T.saving = false;
+    }
+  }
+  async function flushText() {
+    if (!T.cm) return;
+    clearTimeout(T.timer);
+    for (let i = 0; i < 40 && T.saving; i++) await new Promise(r => setTimeout(r, 100));
+    if (T.dirty && !T.conflict) await saveText();
+  }
+  async function saveNow() {
+    await flushText();
+    if (T.cm && !T.dirty && !T.conflict) toast('Saved');
+  }
+
+  function showConflict(server) {
+    if (T.cm && server.current === editorText()) {      // our last save arrived; only its answer was lost
+      T.sha = server.sha256; T.dirty = false; setStatus('Saved');
+      return;
+    }
+    T.conflict = server;
+    setStatus('Not saved');
+    $('#conflict').hidden = false;
+  }
+  $('#keepMine').addEventListener('click', () => {
+    T.sha = T.conflict.sha256; T.conflict = null;
+    $('#conflict').hidden = true;
+    saveText();
+  });
+  $('#useOther').addEventListener('click', () => {
+    const server = T.conflict;
+    T.conflict = null;
+    $('#conflict').hidden = true;
+    T.cm.setValue(server.current);                      // Undo still brings your text back
+    T.sha = server.sha256;
+  });
+
+  $('#revertBtn').addEventListener('click', () => {
+    if (!T.cm || T.cm.getOption('readOnly')) return;
+    if (T.cm.getValue('\n') === T.origLines.join('\n')) { toast('There are no edits'); return; }
+    T.cm.setValue(T.origLines.join('\n'));
+    toast('Back to the file as queued. Undo brings your edits back.', 4000);
+  });
+
+  // What differs between two lists, as [aFrom, aTo, bFrom, bTo]. A very long changed stretch counts as one change.
+  function diffSeq(a, b) {
+    let s = 0, ea = a.length, eb = b.length;
+    while (s < ea && s < eb && a[s] === b[s]) s++;
+    while (ea > s && eb > s && a[ea - 1] === b[eb - 1]) { ea--; eb--; }
+    const n = ea - s, m = eb - s;
+    if (!n && !m) return [];
+    if (!n || !m || n * m > 4000000) return [[s, ea, s, eb]];
+    const w = m + 1, L = new Uint16Array((n + 1) * w);
+    for (let i = n - 1; i >= 0; i--) {
+      for (let j = m - 1; j >= 0; j--) {
+        L[i * w + j] = a[s + i] === b[s + j] ? L[(i + 1) * w + j + 1] + 1 : Math.max(L[(i + 1) * w + j], L[i * w + j + 1]);
+      }
+    }
+    const out = [];
+    let i = 0, j = 0, cur = null;
+    while (i < n || j < m) {
+      if (i < n && j < m && a[s + i] === b[s + j]) { cur = null; i++; j++; continue; }
+      if (!cur) { cur = [s + i, s + i, s + j, s + j]; out.push(cur); }
+      if (j < m && (i >= n || L[i * w + j + 1] >= L[(i + 1) * w + j])) { j++; cur[3] = s + j; } else { i++; cur[1] = s + i; }
+    }
+    return out;
+  }
+
+  // Tint what differs from the file as queued, and leave a small tick where text was removed.
+  function refreshChanges() {
+    const cm = T.cm;
+    const gone = (line, ch) => {
+      const w = document.createElement('span');
+      w.className = 'cm-gone';
+      T.marks.push(cm.setBookmark({ line, ch }, { widget: w }));
+    };
+    const tint = (from, to) => T.marks.push(cm.markText(from, to, { className: 'cm-changed' }));
+    cm.operation(() => {
+      T.marks.forEach(m => m.clear());
+      T.marks = [];
+      const now = cm.getValue('\n').split('\n');
+      for (const [a0, a1, b0, b1] of diffSeq(T.origLines, now)) {
+        if (a1 - a0 === b1 - b0) {
+          for (let k = 0; k < b1 - b0; k++) {
+            const A = T.origLines[a0 + k].split(/(\s+)/), B = now[b0 + k].split(/(\s+)/), at = [0];
+            B.forEach(x => at.push(at[at.length - 1] + x.length));
+            for (const [, , w0, w1] of diffSeq(A, B)) {
+              if (at[w1] > at[w0]) tint({ line: b0 + k, ch: at[w0] }, { line: b0 + k, ch: at[w1] });
+              else gone(b0 + k, at[w0]);
+            }
+          }
+        } else if (b1 > b0) {
+          tint({ line: b0, ch: 0 }, { line: b1 - 1, ch: now[b1 - 1].length });
+        } else {
+          gone(Math.min(b0, now.length - 1), 0);
+        }
+      }
+    });
+  }
+
+  // ------------------------------------------------------------ images in a text file
+
+  const IMAGE_FORMS = {
+    md: [/!\[([^\]]*)\]\(\s*<?([^)\s>]+)>?[^)]*\)/g, /<img\b[^>]*\bsrc\s*=\s*["']()([^"']+)["']/gi],
+    tex: [/\\includegraphics\s*(?:\[()[^\]]*\]\s*)?\{([^}]+)\}/g],
+  };
+
+  function findImages() {
+    const name = S.item.file.toLowerCase();
+    const forms = /\.tex$/.test(name) ? IMAGE_FORMS.tex : /\.(md|markdown)$/.test(name) ? IMAGE_FORMS.md : [];
+    const out = [];
+    T.cm.getValue('\n').split('\n').forEach((text, line) => {
+      if (forms === IMAGE_FORMS.tex) text = text.replace(/(^|[^\\])%.*$/, '$1');
+      const here = [];
+      for (const re of forms) {
+        re.lastIndex = 0;
+        let m;
+        while ((m = re.exec(text))) here.push({ at: m.index, line, alt: m[1] || '', ref: m[2].trim() });
+      }
+      here.sort((a, b) => a.at - b.at).forEach(x => out.push(x));
+    });
+    return out;
+  }
+
+  function imageSrc(ref) {
+    if (/^(data:image\/|https?:\/\/)/i.test(ref)) return ref;
+    return T.images[ref] ? '/api/items/' + S.item.id + '/images/' + encodeURIComponent(T.images[ref]) : null;
+  }
+  const refLabel = ref => (/^data:/i.test(ref) ? 'embedded image' : ref);
+
+  function buildFigure(x) {
+    const fig = document.createElement('figure');
+    fig.className = 'cm-figure';
+    const src = imageSrc(x.ref), cap = document.createElement('figcaption');
+    cap.textContent = x.alt || refLabel(x.ref);
+    if (!src) {
+      fig.classList.add('missing');
+      cap.textContent = 'Image not sent: ' + refLabel(x.ref) + ' ';
+      const b = document.createElement('button');
+      b.textContent = 'Add image';
+      b.addEventListener('click', () => { T.addRef = x.ref; $('#imageFile').click(); });
+      cap.appendChild(b);
+    } else {
+      const a = document.createElement('a');
+      a.href = src; a.target = '_blank'; a.rel = 'noopener noreferrer';
+      if (/\.pdf$/i.test(T.images[x.ref] || '')) {
+        const c = document.createElement('canvas');
+        a.appendChild(c);
+        drawPdfFigure(c, src, fig);
+      } else {
+        const img = document.createElement('img');
+        img.alt = x.alt; img.src = src;
+        img.addEventListener('load', () => { if (fig.widget) fig.widget.changed(); });
+        a.appendChild(img);
+      }
+      fig.appendChild(a);
+    }
+    fig.appendChild(cap);
+    return fig;
+  }
+
+  // A PDF figure, as LaTeX files often have: browsers cannot show one in an image, so draw its first page.
+  async function drawPdfFigure(canvas, src, fig) {
+    try {
+      const pdf = await pdfjsLib.getDocument({ url: src, withCredentials: true }).promise;
+      const page = await pdf.getPage(1);
+      const width = Math.min($('#editor').clientWidth || 700, 900) * Math.min(window.devicePixelRatio || 1, 2);
+      const vp = page.getViewport({ scale: width / page.getViewport({ scale: 1 }).width });
+      canvas.width = Math.floor(vp.width); canvas.height = Math.floor(vp.height);
+      await page.render({ canvasContext: canvas.getContext('2d'), viewport: vp }).promise;
+      pdf.destroy();
+      if (fig.widget) fig.widget.changed();
+    } catch (e) {
+      $('figcaption', fig).textContent += ' (could not draw this PDF: ' + e.message + ')';
+    }
+  }
+
+  function refreshImages() {
+    const found = findImages();
+    const key = found.map(x => x.line + ':' + x.ref).join('\n');
+    // Replacing a line (Revert, or deleting and undoing) takes its image with it, even if the text ends up the same.
+    const intact = T.refs.every(x => ((T.cm.lineInfo(x.line) || {}).widgets || []).includes(x.widget));
+    if (key === T.imgKey && intact) return;
+    T.imgKey = key;
+    T.cm.operation(() => {
+      T.refs.forEach(x => x.widget.clear());
+      const seen = {};
+      found.forEach(x => {
+        seen[x.ref] = (seen[x.ref] || 0) + 1;
+        const k = x.ref + '#' + seen[x.ref];
+        if (!T.nodes.has(k)) T.nodes.set(k, buildFigure(x));
+        x.node = T.nodes.get(k);
+        x.widget = x.node.widget = T.cm.addLineWidget(x.line, x.node, { handleMouseEvents: true });
+      });
+    });
+    T.refs = found;
+    const b = $('#imagesBtn');
+    b.hidden = !found.length;
+    b.textContent = 'Images (' + found.length + ')';
+    if (!$('#imagesPanel').hidden) renderImagesPanel();
+  }
+
+  function renderImagesPanel() {
+    const L = $('#imagesPanel');
+    L.innerHTML = '<div class="list-head"><b>' + T.refs.length + ' image' + (T.refs.length === 1 ? '' : 's') + '</b>' +
+      '<span class="muted">in the order of the text</span><button id="imagesClose">Close</button></div>' +
+      T.refs.map((x, k) => {
+        const src = imageSrc(x.ref), pdf = /\.pdf$/i.test(T.images[x.ref] || '');
+        return '<div class="li" data-k="' + k + '"><span class="badge discuss">' + (k + 1) + '</span><div>' +
+          (src && !pdf ? '<img class="li-thumb" alt="" src="' + esc(src) + '">' : '') +
+          '<div class="li-note">' + esc(x.alt || refLabel(x.ref)) + '</div>' +
+          '<div class="li-meta">line ' + (x.line + 1) + (src ? (pdf ? ' &middot; PDF' : '') : ' &middot; not sent') + '</div></div></div>';
+      }).join('');
+    $('#imagesClose').addEventListener('click', () => { L.hidden = true; });
+    $$('.li', L).forEach(el => el.addEventListener('click', () => {
+      const x = T.refs[Number(el.dataset.k)];
+      x.node.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      T.cm.setCursor({ line: x.line, ch: 0 });
+      if (window.innerWidth < 700) L.hidden = true;
+    }));
+  }
+  $('#imagesBtn').addEventListener('click', () => {
+    const L = $('#imagesPanel');
+    if (!L.hidden) { L.hidden = true; return; }
+    L.style.top = $('#bar').getBoundingClientRect().bottom + 'px';
+    renderImagesPanel();
+    L.hidden = false;
+  });
+
+  $('#imageFile').addEventListener('change', async () => {
+    const f = $('#imageFile').files[0], ref = T.addRef;
+    $('#imageFile').value = '';
+    if (!f || !ref || !T.cm) return;
+    try {
+      const q = new URLSearchParams({ ref, filename: f.name });
+      const r = await fetch('/api/items/' + S.item.id + '/images?' + q.toString(), {
+        method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': f.type || 'application/octet-stream', 'X-Review': '1' }, body: f });
+      let body = {};
+      try { body = await r.json(); } catch (e) { /* not JSON */ }
+      if (!r.ok) throw new Error(body.error || r.statusText);
+      T.images = body.images;
+      Array.from(T.nodes.keys()).filter(k => k.startsWith(ref + '#')).forEach(k => T.nodes.delete(k));
+      T.imgKey = '';
+      refreshImages();
+      toast('Image added');
+    } catch (e) {
+      toast('Could not add it: ' + e.message, 5000);
+    }
+  });
+
   // ------------------------------------------------------------ viewer
 
   function teardown() {
     S.loadToken++;
+    closeText();
     if (S.pdf) { try { S.pdf.destroy(); } catch (e) { /* ignore */ } }
     S.pdf = null; S.pages = []; S.openN = null; S.lastRange = null;
     $('#pages').innerHTML = '';
@@ -262,6 +689,7 @@
     S.canTranscribe = !!data.transcribe;
     $('#title').textContent = S.item.title; document.title = S.item.title;
     updateDoneBtn();
+    if (S.item.kind === 'text') return openText(data, token);
     try { S.pdf = await pdfjsLib.getDocument({ url: '/api/items/' + id + '/file', withCredentials: true }).promise; }
     catch (e) { $('#pages').innerHTML = '<div class="loading error">Could not load the PDF: ' + esc(e.message) + '</div>'; return; }
     if (token !== S.loadToken) return;
@@ -949,6 +1377,7 @@
     clearTimeout(saveTimer);
     for (let i = 0; i < 40 && S.saving; i++) await new Promise(r => setTimeout(r, 100));
     if (S.dirty && S.item) await save();
+    await flushText();
   }
   window.addEventListener('pagehide', () => {
     commitNote();
@@ -956,6 +1385,12 @@
       fetch('/api/items/' + S.item.id + '/highlights', {
         method: 'PUT', keepalive: true, credentials: 'same-origin', headers: { 'Content-Type': 'application/json', 'X-Review': '1' },
         body: JSON.stringify({ base_version: S.version, max_n: S.maxN, highlights: S.hl }),
+      }).catch(() => {});
+    }
+    if (T.cm && T.dirty && !T.conflict && S.item) {
+      fetch('/api/items/' + S.item.id + '/text', {
+        method: 'PUT', keepalive: true, credentials: 'same-origin', headers: { 'Content-Type': 'application/json', 'X-Review': '1' },
+        body: JSON.stringify({ base_sha256: T.sha, text: editorText() }),
       }).catch(() => {});
     }
   });
@@ -974,7 +1409,9 @@
       lines.push('<b>Replaced</b> by ' + (i.superseded_version == null ? 'a newer version' : 'v' + i.superseded_version) +
         ', closed ' + (i.superseded_auto ? 'automatically ' : '') + esc(fmtTime(i.superseded_at)) + '. Reopen puts it back in Waiting.');
     }
+    if (i && i.kind === 'text' && i.status === 'done') lines.push('<b>Done</b> ' + esc(fmtTime(i.done_at)) + '. Reopen to edit it again.');
     if (i && i.note) lines.push('<b>Note:</b> ' + esc(i.note));
+    if (T.cm) T.cm.setOption('readOnly', S.reopen);
     brief.hidden = !lines.length;
     brief.innerHTML = lines.map(l => '<div>' + l + '</div>').join('');
   }
@@ -982,20 +1419,22 @@
     if (!S.item) return;
     closeSheet();
     await flush();
+    if (T.cm && (T.conflict || T.dirty)) { toast(T.conflict ? 'Choose a version first' : 'Your edits are not saved yet; try again in a moment', 4000); return; }
     try {
       if (S.reopen) {
         S.item = (await api('/api/items/' + S.item.id + '/done', { method: 'DELETE' })).item;
         updateDoneBtn(); toast('Reopened');
       } else {
         S.item = (await api('/api/items/' + S.item.id + '/done', { method: 'POST', body: '{}' })).item;
-        toast('Done: ' + S.item.count + ' highlight' + (S.item.count === 1 ? '' : 's') + ' saved', 3000);
+        toast(S.item.kind === 'text' ? (S.item.edited ? 'Done: your edits are saved' : 'Done: no edits') :
+          'Done: ' + S.item.count + ' highlight' + (S.item.count === 1 ? '' : 's') + ' saved', 3000);
         location.hash = '#/';
       }
     } catch (e) { toast('Could not save that: ' + e.message, 5000); }
   });
 
   // test hook for automated checks
-  window.__review = { S, boundaryAt, rangeBetween, addFromRange, rangeText, rangeParts, save, flush };
+  window.__review = { S, T, boundaryAt, rangeBetween, addFromRange, rangeText, rangeParts, save, flush };
 
   route();
 })();

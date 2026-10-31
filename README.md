@@ -1,8 +1,8 @@
 # review-server
 
-A review queue for PDFs. Agents add a PDF to the queue. You open the queue on an iPad, highlight text by selecting it or by drawing over it with an Apple Pencil, tag each highlight "change" or "discuss," dictate a note or record a voice note if you want one, and tap Done. Agents then read the numbered highlights and match them with what you tell them.
+A review queue for PDFs and text files. Agents add a file to the queue. You open the queue on an iPad, highlight a PDF by selecting text or by drawing over it with an Apple Pencil, tag each highlight "change" or "discuss," dictate a note or record a voice note if you want one, and tap Done. Agents then read the numbered highlights and match them with what you tell them. A `.txt`, `.md`, or `.tex` file opens in an editor instead, and agents read your edits as a diff.
 
-Each queued item is a folder of plain files. Agents on the server's machine write the folder next to the document it reviews, so git carries it with the rest of the repository. Agents elsewhere send the PDF to the server, which keeps it in its inbox folder.
+Each queued item is a folder of plain files. Agents on the server's machine write the folder next to the document it reviews, so git carries it with the rest of the repository. Agents elsewhere send the file to the server, which keeps it in its inbox folder.
 
 One Python file, standard library only, plus a static page.
 
@@ -20,7 +20,7 @@ The server listens only on its own machine (port 8765). `tailscale serve` passes
 
 In Safari, Share › Add to Home Screen makes it open like an app.
 
-The server shows items from every folder named `review_queue` under its roots (give `--root` once for each folder to search). `--inbox` adds one more root, where PDFs sent from elsewhere go.
+The server shows items from every folder named `review_queue` under its roots (give `--root` once for each folder to search). `--inbox` adds one more root, where files sent from elsewhere go.
 
 Without `tailscale serve`, add `--lan` to the serve command instead. The server then listens on the machine's network addresses too, prints an address with a token for other devices, and keeps that token in `~/.config/review-server/token`.
 
@@ -61,7 +61,7 @@ The server then loads the speech model when the first clip arrives, keeps it in 
 
 ## Send something to review
 
-- **You, from any device:** tap Add PDF on the queue page and pick a file.
+- **You, from any device:** tap Add file on the queue page and pick a PDF or a text file.
 - **An agent on the server's machine:** `review.py queue` (below). The item sits next to its draft and is committed with it.
 - **An agent anywhere on your tailnet:** `review.py push` (below), or the same request with curl. The item goes to the inbox at once, with no sync.
 
@@ -79,13 +79,28 @@ The server then loads the speech model when the first clip arrives, keeps it in 
 
 Everything saves as you go. If the same item is open on two devices, the changes are merged.
 
+The **Theme** button at the top of every page switches between following the device, dark, and light. Each device remembers its choice.
+
+## Edit a text file
+
+A `.txt`, `.md`, `.markdown`, or `.tex` file (UTF-8, up to 5 MB) opens in an editor: one centered column of text, wrapped on screen. Wrapping never adds line breaks to the file. The toolbar slides away while you type and comes back when you move the pointer or touch the screen.
+
+- **Vim keys.** Tick the box for vim keys; each device remembers it. Insert, visual, `/` search, `u`, and the rest work, `:w` saves at once, and `:q` or `:wq` goes back to the queue. On a keyboard without an Esc key, use Ctrl-[. Without vim keys it is an ordinary text box, where Cmd-S or Ctrl-S saves at once.
+- **Highlighting.** Markdown and LaTeX get quiet syntax colors. Words you have changed have a soft tint, and a small tick marks where you removed text.
+- **Saving.** Edits save as you type. The file as queued never changes; your version goes to `edited/<name>` in the item folder. **Revert** goes back to the file as queued, and Undo brings your edits back.
+- **Two devices.** If the file changed on another device since this page loaded it, the page stops saving and asks whether to keep your version or use the other.
+- **Done** saves first, then marks the item finished. A finished or replaced item is read-only until you tap Reopen.
+- **Images.** Each image the text refers to (`![](...)` or `<img>` in Markdown, `\includegraphics` in LaTeX, including PDF figures and `\graphicspath`) shows under the line that refers to it. **Images** lists them in the order of the text; tap one to jump to it. Tap an image to open it by itself. `review.py queue` and `push` bring along any image in the file's folder or git repository, and nothing from outside it. An image that did not come along shows an **Add image** button.
+
+There are no voice notes in the editor: you change the text itself. The iPad keyboard's dictation works as in any text box.
+
 ## Versions
 
 Name drafts with `_v` and a number, sometimes followed by more: `Lab_grant_application_v8_review_highlighted.pdf` and `Lab_grant_application_v9.pdf` are versions 8 and 9 of one document, `Lab_grant_application`. The server takes the last `_v<number>` in the PDF's name that is followed by `_`, the extension, or nothing, as the version, and everything before it as the document. So `Lab_research_plan_v4_PREVIEW.pdf` is version 4 of `Lab_research_plan`, and `Lab_grant_cover_email_v8.pdf` is a different document from the application. A name without a version is a document of its own. `doc` and `version` in `request.json` (set with `--doc` and `--version`, or `doc=` and `version=` when sending) take the place of what the name says.
 
 Only a higher version replaces an older one. Two items of the same document with the same version (for example, the application and a copy made for a collaborator) stay separate.
 
-When a higher version of a document is queued, by any route, the server closes the older versions that are still waiting and have no highlights and no voice notes, within a few seconds. It never closes one you have marked; those wait for Mark older done. Closing writes `done.json` with `superseded_by` (the newer item's id), `superseded_version`, `superseded_at`, and `automatic`. Nothing else in the folder changes, and nothing is moved or deleted. The item's status becomes `superseded`, not `done`.
+When a higher version of a document is queued, by any route, the server closes the older versions that are still waiting and have no highlights, voice notes, or edits, within a few seconds. It never closes one you have marked or edited; those wait for Mark older done. The extension does not matter, so `Plan_v2.tex` replaces `Plan_v1.pdf`. Closing writes `done.json` with `superseded_by` (the newer item's id), `superseded_version`, `superseded_at`, and `automatic`. Nothing else in the folder changes, and nothing is moved or deleted. The item's status becomes `superseded`, not `done`.
 
 To undo a closing, open the item under Replaced and tap Reopen, or send `curl -X DELETE -H 'X-Review: 1' http://127.0.0.1:8765/api/items/<id>/done` on the server's machine. The server remembers what it closed (in `~/.config/review-server/replaced.json`, or `serve --state FILE`), so a reopened item stays in Waiting until a still newer version arrives. Deleting its `done.json` by hand has the same effect. `serve --no-auto-close` turns automatic closing off; Mark older done still works.
 
@@ -139,26 +154,32 @@ Then:
 - Highlights belong to the copy in the item folder. If the draft has changed since it was queued (compare `sha256` in `request.json`), say so before applying anything.
 - Do not edit `highlights.json` or `done.json`; the server writes them.
 
+For a text file, queue or push it the same way. `show` and `pull` print a diff of the reviewer's edits, or say there were none. `show --json` and `/api/items/<id>` give `text.original`, `text.current`, `text.diff`, and `text.edited`; the edited file is also at `edited/<name>` in the item folder. Apply the edits from `current`, and do not write to `edited/` yourself. As with PDFs, only `done` means the reviewer finished.
+
+Without the script, send an image a text file refers to with `curl -X POST -H 'X-Review: 1' --data-binary @fig.png '<server>/api/items/<id>/images?ref=<the path as written in the text>&filename=fig.png'`.
+
 ## Files in an item folder
 
 ```
 <folder>/review_queue/<YYYY-MM-DD>_<name>/
-    <name>.pdf        the exact copy under review
-    request.json      written when queued: title, note, pdf, sha256, source, queued_by, queued_at, and group if sent
-                      from elsewhere; doc and version if given
+    <name>.pdf        the exact copy under review (or <name>.md, .tex, or .txt for a text file)
+    request.json      written when queued: title, note, pdf or text, sha256, source, queued_by, queued_at, and group if
+                      sent from elsewhere; doc and version if given; images, a map from each reference in the text to its file
     highlights.json   written by the server: {"version", "updated_at", "max_n", "highlights": [...]}
     done.json         written when the reviewer taps Done, or when a newer version replaces the item (then with
                       superseded_by); deleted if they reopen the item
     audio/            voice notes (<highlight id>_<time>.m4a or .webm) and their text (<clip>.json)
+    edited/<name>     a text file with the reviewer's edits; gone again if they undo every edit
+    images/           the images a text file refers to
 ```
 
 Each highlight has `n` (its number), `tag` ("change" or "discuss"), `page`, `text`, `note`, `rects` (page, x, y, width, and height in PDF points from the top-left corner of the page), `audio` (its voice notes: file, seconds), and `created_at` and `updated_at`.
 
 ## Notes
 
-- Needs Python 3.8 or later and nothing else; faster-whisper is optional, for voice-note text. PDF.js 3.11.174 (Mozilla, Apache License 2.0) is included in `static/pdfjs/`.
+- Needs Python 3.8 or later and nothing else; faster-whisper is optional, for voice-note text. PDF.js 3.11.174 (Mozilla, Apache License 2.0) is included in `static/pdfjs/`, and CodeMirror 5.65.21 (MIT License) in `static/codemirror/`.
 - Recording needs the `https://` address (browsers allow the microphone only on secure pages), which `tailscale serve` provides.
 - The server reads only folders named `review_queue` under its roots. It writes `highlights.json` and `done.json` there, and new item folders only in its inbox. Its record of replaced items is in `~/.config/review-server/replaced.json`.
 - Requests that change anything must carry the header `X-Review: 1`, which other websites cannot add, so a page elsewhere cannot change the queue through your browser.
 - Tests: `python3 -m unittest -v test_review` in this folder (temporary folders only).
-- License: MIT (see `LICENSE`); PDF.js keeps its own license in `static/pdfjs/LICENSE`.
+- License: MIT (see `LICENSE`); PDF.js and CodeMirror keep their own licenses in `static/pdfjs/LICENSE` and `static/codemirror/LICENSE`.
