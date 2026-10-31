@@ -64,6 +64,7 @@ window.reviewVim = (function () {
     const goal = vim.screenEnd ? 1e6 : vim.screenGoal;
     let cur = head;
     for (let i = 0; i < (args.repeat || 1); i++) cur = oneRow(cm, cur, goal, args.forward);
+    if (cur === head) return null;       // nowhere to go, which ends a macro
     vim.lastHPos = vim.screenEnd ? Infinity : cur.ch;
     vim.lastHSPos = goal;
     return cur;
@@ -192,23 +193,38 @@ window.reviewVim = (function () {
   ['g??', 'g?g?'].forEach(keys => Vim._mapCommand({ keys, type: 'operatorMotion', operator: 'rot13', motion: 'expandToLine', motionArgs: { linewise: true }, isEdit: true }));
 
   // gq and gw: rewrap paragraphs to 'textwidth', or to 79 columns if that is 0, as Vim does.
+  // Comments and quotes keep their leader on each line, and list items their indent. None of them merge with the text
+  // around them, so a LaTeX comment cannot swallow live text. Spacing inside a line stays as it was.
   function wrapText(text, width) {
     const tail = /\n$/.test(text) ? '\n' : '';
     const out = [];
-    let words = [], indent = '';
+    let para = null;
     const flush = () => {
-      let line = '';
-      for (const w of words) {
-        if (line && indent.length + line.length + 1 + w.length > width) { out.push(indent + line); line = w; }
-        else line = line ? line + ' ' + w : w;
+      if (!para) return;
+      const tokens = para.text.match(/\S+\s*/g) || [];
+      let line = para.first;
+      let empty = true;
+      for (const t of tokens) {
+        if (!empty && (line + t).trimEnd().length > width) { out.push(line.trimEnd()); line = para.next; empty = true; }
+        line += t;
+        empty = false;
       }
-      if (line) out.push(indent + line);
-      words = [];
+      out.push(line.trimEnd());
+      para = null;
     };
     for (const l of text.replace(/\n$/, '').split('\n')) {
-      if (!l.trim()) { flush(); out.push(''); continue; }
-      if (!words.length) indent = /^\s*/.exec(l)[0];
-      words.push(...l.trim().split(/\s+/));
+      if (!l.trim()) { flush(); out.push(l); continue; }
+      const m = /^(\s*)(%+\s*|>+\s*|[-*+]\s+|\d+[.)]\s+)?/.exec(l), lead = m[0], mark = m[2] || '', body = l.slice(lead.length);
+      const repeats = /^[%>]/.test(mark);
+      if (mark && !repeats) {        // a new list item
+        flush();
+        para = { first: lead, next: ' '.repeat(lead.length), leader: null, text: body };
+      } else if (para && para.leader === (repeats ? lead : null) && (repeats || !mark)) {
+        para.text = para.text.trimEnd() + ' ' + body;
+      } else {
+        flush();
+        para = { first: lead, next: lead, leader: repeats ? lead : null, text: body };
+      }
     }
     flush();
     return out.join('\n') + tail;
@@ -230,6 +246,7 @@ window.reviewVim = (function () {
 
   // In visual mode S and R replace whole lines; the keymap's S left the text in place.
   Vim.mapCommand('S', 'operator', 'change', { linewise: true, fullLine: true }, { context: 'visual', exitVisualBlock: true });
+  Vim.mapCommand('X', 'operator', 'delete', { linewise: true, notInBlock: true }, { context: 'visual' });
   Vim._mapCommand({ keys: 'gp', type: 'action', action: 'paste', isEdit: true, actionArgs: { after: true, isEdit: true, cursorAfter: true } });
   Vim._mapCommand({ keys: 'gP', type: 'action', action: 'paste', isEdit: true, actionArgs: { after: false, isEdit: true, cursorAfter: true } });
   Vim.map('&', ':s', 'normal');
@@ -241,26 +258,44 @@ window.reviewVim = (function () {
 
   // cw, o, s and the like make two steps in the editor's history, the change and the typing; Vim undoes both as one.
   // And the cursor goes to where the change was.
-  function stepHistory(cm, step, repeat) {
+  function stepHistory(cm, step, repeat, map) {
     let first = null;
     const note = (_c, ch) => {
       if (first && cmp(ch.from, first) >= 0) return;
       // Undoing an added line starts at the end of the line above; the cursor belongs at that line's start.
       first = ch.from.ch && ch.from.ch >= lineLen(cm, ch.from.line) && (ch.to.line > ch.from.line || ch.text.length > 1) ? new Pos(ch.from.line, 0) : ch.from;
     };
-    const pairs = cm.state.undoPairs || new Set();
+    const pairs = cm.state.undoPairs || new Set(), spans = cm.state[map] || new Map();
+    const gen = () => cm.changeGeneration();
+    // Go to the other end of an insert, if we are at one end of it, stepping over pauses and Backspaces.
+    const acrossInsert = () => {
+      if (!spans.has(gen())) return false;
+      const target = spans.get(gen());
+      for (let n = 0; n < 20000 && gen() !== target; n++) {
+        const before = gen();
+        step();
+        if (gen() === before) break;
+      }
+      return true;
+    };
     cm.on('beforeChange', note);
     cm.operation(() => {
       for (let i = 0; i < (repeat || 1); i++) {
-        step();
-        for (const gen of pairs) { if (cm.isClean(gen)) { step(); break; } }
+        if (map === 'undoSpans') {
+          if (!acrossInsert()) step();
+          if (pairs.has(gen())) step();
+        } else {
+          if (pairs.has(gen())) { acrossInsert() || step(); continue; }
+          if (!acrossInsert()) step();
+          if (pairs.has(gen())) acrossInsert() || step();
+        }
       }
     });
     cm.off('beforeChange', note);
     if (first) cm.setCursor(clampLine(cm, first.line), Math.min(first.ch, Math.max(0, lineLen(cm, clampLine(cm, first.line)) - 1)));
   }
-  Vim.defineAction('undo', (cm, args) => stepHistory(cm, () => cm.undo(), args.repeat));
-  Vim.defineAction('redo', (cm, args) => stepHistory(cm, () => cm.redo(), args.repeat));
+  Vim.defineAction('undo', (cm, args) => stepHistory(cm, () => cm.undo(), args.repeat, 'undoSpans'));
+  Vim.defineAction('redo', (cm, args) => stepHistory(cm, () => cm.redo(), args.repeat, 'redoSpans'));
 
   // U: undo all the latest changes on one line.
   Vim.defineAction('lineUndo', cm => {
@@ -303,6 +338,7 @@ window.reviewVim = (function () {
   inInsert('<C-o>', cm => {
     const u = cm.getCursor(), atEnd = u.ch >= lineLen(cm, u.line) && u.ch > 0;
     Vim.exitInsertMode(cm);
+    if (!atEnd) cm.setCursor(u);        // leaving insert mode steps left, but Ctrl-O does not
     let key = '';
     const note = e => { if (e.key.length === 1) key = e.key; };
     const back = () => {
@@ -354,10 +390,31 @@ window.reviewVim = (function () {
     }
   }, true);
   document.addEventListener('keydown', e => {
+    const box = e.target && e.target.closest && e.target.closest('.CodeMirror-dialog') ? e.target : null;
+    // Ctrl-R in the : and / prompts: the next key names a register, or Ctrl-W means the word under the cursor.
+    if (box && !waiting && e.ctrlKey && e.key === 'r') {
+      e.preventDefault(); e.stopPropagation();
+      waiting = { kind: 'prompt', input: box };
+      return;
+    }
     if (!waiting || ['Shift', 'Control', 'Alt', 'Meta'].includes(e.key)) return;
     const w = waiting, k = e.key;
     e.preventDefault(); e.stopPropagation();
     if (k === 'Escape') { waiting = null; return; }
+    if (w.kind === 'prompt') {
+      waiting = null;
+      let text = '';
+      if (e.ctrlKey && k === 'w' && current) {
+        const word = current.findWordAt(current.getCursor());
+        text = current.getRange(word.anchor, word.head);
+      } else if (k.length === 1 && reg().getRegister(k)) {
+        text = reg().getRegister(k).toString().replace(/\n$/, '');
+      }
+      const i = w.input, from = i.selectionStart;
+      i.value = i.value.slice(0, from) + text + i.value.slice(i.selectionEnd);
+      i.selectionStart = i.selectionEnd = from + text.length;
+      return;
+    }
     if (w.kind === 'register') {
       waiting = null;
       const r = k.length === 1 ? reg().getRegister(k) : null;
@@ -436,6 +493,12 @@ window.reviewVim = (function () {
 
   // ------------------------------------------------------------ : commands
 
+  // Lines that do not exist are an error, as in Vim, not the nearest line.
+  const ex = (name, short, fn) => Vim.defineEx(name, short, (cm, p) => {
+    const bad = l => l !== undefined && (l < cm.firstLine() || l > cm.lastLine());
+    if (bad(p.line) || bad(p.lineEnd)) { say(cm, 'Invalid range'); return; }
+    fn(cm, p);
+  });
   const rangeOf = (cm, p) => {
     const from = p.line === undefined ? cm.getCursor().line : p.line, to = p.lineEnd === undefined ? from : p.lineEnd;
     return [clampLine(cm, Math.min(from, to)), clampLine(cm, Math.max(from, to))];
@@ -457,19 +520,19 @@ window.reviewVim = (function () {
     return [start, clampLine(cm, start + count - 1)];
   };
   const landOn = (cm, line) => { line = clampLine(cm, line); cm.setCursor(line, firstNonBlank(cm.getLine(line))); };
-  Vim.defineEx('delete', 'd', (cm, p) => {
+  ex('delete', 'd', (cm, p) => {
     const { name, count } = regAndCount(p), [from, to] = withCount(cm, p, rangeOf(cm, p), count);
-    reg().pushText(name, 'delete', textOf(cm, from, to), true);
+    reg().pushText(name, 'delete', textOf(cm, from, to) + '\n', true);
     removeLines(cm, from, to);
     landOn(cm, from);
   });
-  Vim.defineEx('yank', 'y', (cm, p) => {
+  ex('yank', 'y', (cm, p) => {
     const { name, count } = regAndCount(p), [from, to] = withCount(cm, p, rangeOf(cm, p), count);
-    reg().pushText(name, 'yank', textOf(cm, from, to), true);
+    reg().pushText(name, 'yank', textOf(cm, from, to) + '\n', true);
   });
   // The target line of :m and :t, written as 3, ., $, or 'a: the 1-based line to put text after; 0 is the top.
   function targetLine(cm, arg) {
-    const m = /^\s*(\.|\$|'[a-z]|\d+)?\s*([+-]\d*)?\s*$/.exec(arg || '');
+    const m = /^\s*(\.|\$|'[a-z<>]|\d+)?\s*([+-]\d*)?\s*$/.exec(arg || '');
     if (!m) return null;
     const a = m[1];
     let line;
@@ -481,7 +544,7 @@ window.reviewVim = (function () {
       line = f.line + 1;
     } else line = Number(a);
     if (m[2]) line += m[2].length > 1 ? Number(m[2]) : (m[2] === '+' ? 1 : -1);
-    return line;
+    return line < 0 || line > cm.lineCount() ? null : line;
   }
   function insertAfter(cm, after, text) {
     if (after <= 0) cm.replaceRange(text + '\n', new Pos(cm.firstLine(), 0));
@@ -491,7 +554,7 @@ window.reviewVim = (function () {
     }
   }
   // Not named "move": the keymap uses that name for a bare :12.
-  Vim.defineEx('moveLines', 'm', (cm, p) => {
+  ex('moveLines', 'm', (cm, p) => {
     const [from, to] = rangeOf(cm, p), after = targetLine(cm, p.argString);
     if (after === null || (after > from && after <= to)) { say(cm, 'Lines cannot move into themselves'); return; }
     const text = textOf(cm, from, to), n = to - from + 1;
@@ -513,9 +576,9 @@ window.reviewVim = (function () {
     insertAfter(cm, after, textOf(cm, from, to));
     landOn(cm, after + to - from);
   };
-  Vim.defineEx('copy', 'co', copyLines);
-  Vim.defineEx('t', 't', copyLines);
-  Vim.defineEx('join', 'j', (cm, p) => {
+  ex('copy', 'co', copyLines);
+  ex('t', 't', copyLines);
+  ex('join', 'j', (cm, p) => {
     const [from, end] = rangeOf(cm, p), to = from === end ? clampLine(cm, from + 1) : end;
     for (let i = from; i < to; i++) { cm.setCursor(from, 0); Vim.handleKey(cm, 'J', 'mapping'); }
     landOn(cm, from);
@@ -529,30 +592,34 @@ window.reviewVim = (function () {
     });
     landOn(cm, to);
   };
-  Vim.defineEx('>', '>', shifter('add'));
-  Vim.defineEx('<', '<', shifter('subtract'));
+  ex('>', '>', shifter('add'));
+  ex('<', '<', shifter('subtract'));
   Vim.defineEx('&', '&', cm => Vim.handleEx(cm, 's'));
-  Vim.defineEx('normal', 'norm', (cm, p) => {
+  ex('normal', 'norm', (cm, p) => {
     const keys = (p.argString || '').replace(/^!/, '').replace(/^\s/, '');
-    const hasRange = p.line !== undefined;
-    const [from, to] = rangeOf(cm, p);
+    if (/[:/?]/.test(keys)) { say(cm, ':normal cannot use :, /, or ? here'); return; }
+    const state = Vim.getVimGlobalState_().macroModeState;
+    const runKeys = () => {
+      state.failed = false;
+      for (const k of keys) {
+        if (state.failed) break;           // as in Vim, a failed move ends this line's commands
+        if (cm.state.vim.insertMode) cm.replaceSelection(k);
+        else Vim.handleKey(cm, k === ' ' ? '<Space>' : k, 'mapping');
+      }
+      if (cm.state.vim.insertMode) Vim.exitInsertMode(cm);
+      state.failed = false;
+    };
     cm.operation(() => {
-      let end = to;
-      for (let l = from; l <= end && l <= cm.lastLine(); l++) {
-        const count = cm.lineCount();
-        if (hasRange) cm.setCursor(l, 0);
-        for (const k of keys) {
-          if (cm.state.vim.insertMode) cm.replaceSelection(k);
-          else Vim.handleKey(cm, k === ' ' ? '<Space>' : k, 'mapping');
-        }
-        if (cm.state.vim.insertMode) Vim.exitInsertMode(cm);
-        const change = cm.lineCount() - count;
-        end += change;
-        if (change < 0) l += change;
+      if (p.line === undefined) { runKeys(); return; }
+      // As in Vim, by line number and as many times as the range had lines, however the commands add or remove lines.
+      const [from, to] = rangeOf(cm, p);
+      for (let l = from; l <= to; l++) {
+        cm.setCursor(Math.min(l, cm.lastLine()), 0);
+        runKeys();
       }
     });
   });
-  Vim.defineEx('put', 'pu', (cm, p) => {
+  ex('put', 'pu', (cm, p) => {
     const m = /^\s*(!)?\s*(\S)?/.exec(p.argString || ''), r = reg().getRegister(m[2]);
     const text = r.toString().replace(/\n$/, '');
     if (!text) return;
@@ -560,7 +627,13 @@ window.reviewVim = (function () {
     insertAfter(cm, at + (above ? 0 : 1), text);
     landOn(cm, at + (above ? 0 : 1) + text.split('\n').length - 1);
   });
-  const setMark = (cm, p) => { Vim.handleKey(cm, 'm', 'mapping'); Vim.handleKey(cm, (p.argString || '').trim().charAt(0) || 'a', 'mapping'); };
+  const setMark = (cm, p) => {
+    const was = cm.getCursor();
+    if (p.line !== undefined) cm.setCursor(clampLine(cm, p.line), 0);
+    Vim.handleKey(cm, 'm', 'mapping');
+    Vim.handleKey(cm, (p.argString || '').trim().charAt(0) || 'a', 'mapping');
+    cm.setCursor(was);
+  };
   Vim.defineEx('mark', 'ma', setMark);
   Vim.defineEx('k', 'k', setMark);
   Vim.defineEx('edit', 'e', cm => say(cm, 'This page edits one file, and every change is already saved. u undoes; Revert goes back to the file as queued.'));
@@ -582,12 +655,28 @@ window.reviewVim = (function () {
     attach(cm) {
       current = cm;
       cm.state.undoPairs = new Set();
+      cm.state.undoSpans = new Map();
+      cm.state.redoSpans = new Map();
       cm.state.commandGen = cm.changeGeneration();
       cm.on('vim-command-done', () => { if (!cm.state.vim.insertMode) cm.state.commandGen = cm.changeGeneration(); });
       cm.on('beforeChange', (_c, ch) => {
         // Read-only stops keys, but not : commands, which change the text directly.
         if (cm.getOption('readOnly') && ch.origin !== 'setValue' && ch.cancel) { ch.cancel(); return; }
         if (ch.origin === 'setValue') cm.state.lineUndo = null;
+        // Deleting whole lines deletes their marks, as in Vim.
+        const vimState = cm.state.vim;
+        if (vimState && vimState.marks && ch.to.line > ch.from.line && !ch.text.join('')) {
+          for (const k of Object.keys(vimState.marks)) {
+            if (k === '<' || k === '>' || k === '[' || k === ']' || k === '^') continue;
+            const at = vimState.marks[k].find && vimState.marks[k].find();
+            if (!at) continue;
+            // dd takes a line and the break after it; on the last line, the break before it instead.
+            const fromEnd = ch.from.ch && ch.from.ch >= lineLen(cm, ch.from.line);
+            const gone = fromEnd ? at.line > ch.from.line && at.line <= ch.to.line
+              : ch.from.ch === 0 && at.line >= ch.from.line && at.line < ch.to.line;
+            if (gone) { vimState.marks[k].clear(); delete vimState.marks[k]; }
+          }
+        }
         // Where this insert began: its first typed character, since A and the like move the cursor after saying so.
         if (cm.state.vim && cm.state.vim.insertMode && ch.origin === '+input' && !cm.state.insertBegan) {
           cm.state.insertBegan = true;
@@ -614,25 +703,52 @@ window.reviewVim = (function () {
         if (cm.state.vim) cm.state.vim.lastMotion = null;
         keepCursorInView(cm);
       });
+      // An arrow key or a click while inserting starts a new undo step, as in Vim.
+      const breakInsert = () => {
+        if (cm.state.insertGen === undefined) return;
+        const end = cm.changeGeneration(true), start = cm.state.insertGen;
+        if (end !== start) { cm.state.undoSpans.set(end, start); cm.state.redoSpans.set(start, end); }
+        cm.state.insertGen = end;
+      };
+      cm.on('keydown', (_c, e) => {
+        if (/^(Arrow|Home$|End$|Page)/.test(e.key)) breakInsert();
+      });
+      cm.on('mousedown', breakInsert);
       cm.on('vim-mode-change', e => {
-        if (e.mode === 'insert') {
-          cm.state.insertStart = cm.getCursor();
+        if (e.mode === 'insert' || e.mode === 'replace') {
+          if (cm.state.insertGen !== undefined) return;
+          const u = cm.getCursor();
+          cm.state.insertStart = u;
           cm.state.insertBegan = false;
           cm.state.insertTyped = false;
           cm.state.replacedChars = [];
+          // An o, cc, or Enter leaves only an indent on its line, to be removed if nothing is typed.
+          cm.state.openedLine = !cm.isClean(cm.state.commandGen) && !cm.getLine(u.line).trim() ? u.line : -1;
           if (!cm.isClean(cm.state.commandGen)) cm.state.undoPairs.add(cm.changeGeneration(true));
+          cm.state.insertGen = cm.changeGeneration(true);
           return;
         }
-        if (e.mode !== 'normal') return;
-        // Leaving insert mode without typing removes the indent that o or Enter added, as Vim does.
+        if (e.mode !== 'normal' || cm.state.insertGen === undefined) return;
         const u = cm.getCursor(), text = cm.getLine(u.line);
-        if (text && !text.trim() && cm.state.insertTyped === false) {
+        if (text && !text.trim() && cm.state.insertTyped === false && cm.state.openedLine === u.line) {
           cm.replaceRange('', new Pos(u.line, 0), new Pos(u.line, text.length));
         }
+        // All of this insert is one step for u and Ctrl-R, across pauses and Backspaces.
+        const end = cm.changeGeneration(true), start = cm.state.insertGen;
+        if (end !== start) { cm.state.undoSpans.set(end, start); cm.state.redoSpans.set(start, end); }
+        cm.state.insertGen = undefined;
         cm.state.commandGen = cm.changeGeneration();
       });
       cm.on('change', (_c, ch) => {
-        if (cm.state.vim && cm.state.vim.insertMode && ch.origin === '+input' && ch.text.join('').trim()) cm.state.insertTyped = true;
+        if (cm.state.vim && cm.state.vim.insertMode && ch.origin === '+input') {
+          // Enter while inserting opens a line of its own. Its automatic indent is not typing, but a typed space is.
+          if (ch.text.length > 1) {
+            cm.state.openedLine = ch.from.line + ch.text.length - 1;
+            cm.state.insertTyped = false;
+          } else if (ch.text[0].trim() || ch.text[0].length === 1) {
+            cm.state.insertTyped = true;
+          }
+        }
       });
     },
   };

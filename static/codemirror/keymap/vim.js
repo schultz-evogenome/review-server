@@ -858,7 +858,8 @@ function initVim$1(CodeMirror) {
         function handleMacroRecording() {
           var macroModeState = vimGlobalState.macroModeState;
           if (macroModeState.isRecording) {
-            if (key == 'q') {
+            // review-server: only a q on its own stops recording; fq and "q are other commands
+            if (key == 'q' && !vim.inputState.keyBuffer.length && !vim.inputState.operator) {
               macroModeState.exitMacroRecordMode();
               clearInputState(cm);
               return true;
@@ -1489,7 +1490,16 @@ function initVim$1(CodeMirror) {
         }
       },
       processEx: function(cm, vim, command) {
+        var macroState = vimGlobalState.macroModeState;
+        // review-server: : commands in macros: recorded as text, and run without a prompt
+        if (macroState.isPlaying && command.type != 'keyToEx') {
+          var recorded = macroState.replaySearchQueries.shift();
+          if (recorded !== undefined) { exCommandDispatcher.processCommand(cm, recorded); }
+          clearInputState(cm);
+          return;
+        }
         function onPromptClose(input) {
+          if (macroState.isRecording) { logSearchQuery(macroState, input); }
           // Give the prompt some time to close so that if processCommand shows
           // an error, the elements don't overlap.
           vimGlobalState.exCommandHistoryController.pushInput(input);
@@ -1589,12 +1599,18 @@ function initVim$1(CodeMirror) {
           var motionResult = motions[motion](cm, origHead, motionArgs, vim, inputState);
           vim.lastMotion = motions[motion];
           if (!motionResult) {
+            vimGlobalState.macroModeState.failed = true;  // review-server: a failed move ends a macro or :normal
             return;
           }
           // review-server: a move that cannot go anywhere cancels the operator (cb at the top of the file, ch in column 1)
           if (operator && !vim.visualMode && !(motionResult instanceof Array) && cursorEqual(motionResult, origHead) &&
               (motion == 'moveToSymbol' || !motionArgs.forward && (motion == 'moveByCharacters' || motion == 'moveByWords'))) {
+            vimGlobalState.macroModeState.failed = true;
             return;
+          }
+          if (!operator && motion == 'moveByCharacters' && !(motionResult instanceof Array) &&
+              cursorEqual(clipCursorToContent(cm, motionResult), origHead)) {
+            vimGlobalState.macroModeState.failed = true;  // review-server: h and l at the edge of a line fail too
           }
           // review-server: ) to the end of the file takes the last character too
           if (motion == 'moveBySentence' && motionArgs.forward && operator && !(motionResult instanceof Array) &&
@@ -1692,7 +1708,7 @@ function initVim$1(CodeMirror) {
             // Init visual op
             curStart = cursorMin(sel.head, sel.anchor);
             curEnd = cursorMax(sel.head, sel.anchor);
-            linewise = vim.visualLine || operatorArgs.linewise;
+            linewise = vim.visualLine || (operatorArgs.linewise && !(vim.visualBlock && operatorArgs.notInBlock));  // review-server: X
             mode = vim.visualBlock ? 'block' :
                    linewise ? 'line' :
                    'char';
@@ -2542,9 +2558,16 @@ function initVim$1(CodeMirror) {
         } else {
           macroModeState.latestRegister = registerName;
         }
-        while(repeat--){
+        // review-server: stop at the first failure, as Vim does, rather than run on at the cursor
+        var outermost = !macroModeState.playingDepth;
+        if (outermost) { macroModeState.failed = false; }
+        macroModeState.playingDepth = (macroModeState.playingDepth || 0) + 1;
+        while(repeat-- && !macroModeState.failed){
           executeMacroRegister(cm, vim, macroModeState, registerName);
+          macroModeState.isPlaying = macroModeState.playingDepth > 1;
         }
+        macroModeState.playingDepth--;
+        macroModeState.isPlaying = macroModeState.playingDepth > 0;
       },
       enterMacroRecordMode: function(cm, actionArgs) {
         var macroModeState = vimGlobalState.macroModeState;
@@ -2577,7 +2600,7 @@ function initVim$1(CodeMirror) {
         } else if (insertAt == 'bol') {
           head = new Pos(head.line, 0);
         } else if (insertAt == 'charAfter') {
-          head = offsetCursor(head, 0, 1);
+          head = offsetCursor(head, 0, charWidthAt(cm, head));
         } else if (insertAt == 'firstNonBlank') {
           head = motions.moveToFirstNonWhiteSpaceCharacter(cm, head);
         } else if (insertAt == 'startOfSelectedArea') {
@@ -2630,6 +2653,8 @@ function initVim$1(CodeMirror) {
         }
         if (!vimGlobalState.macroModeState.isPlaying) {
           // Only record if not replaying.
+          cm.off('change', onChange);  // review-server: never twice, which doubled what . and macros typed
+          CodeMirror.off(cm.getInputField(), 'keydown', onKeyEventTargetKeyDown);
           cm.on('change', onChange);
           CodeMirror.on(cm.getInputField(), 'keydown', onKeyEventTargetKeyDown);
         }
@@ -2730,11 +2755,13 @@ function initVim$1(CodeMirror) {
             ? text.replace(/\n\r?/g, '')
             : text.replace(/\n\s*/, function(_m, at, all) {
                 var rest = all.slice(at + _m.length);
-                return !rest || rest.charAt(0) == ')' || /\s$/.test(all.slice(0, at)) ? '' : ' ';
+                var before = all.slice(0, at);
+                return !rest || !before || rest.charAt(0) == ')' || /\s$/.test(before) ? '' : ' ';
               });
           cm.replaceRange(text, curStart, tmp);
         }
-        var curFinalPos = new Pos(curStart.line, finalCh);
+        // review-server: joining a blank line leaves nothing after finalCh
+        var curFinalPos = clipCursorToContent(cm, new Pos(curStart.line, finalCh));
         if (vim.visualMode) {
           exitVisualMode(cm, false);
         }
@@ -2815,7 +2842,7 @@ function initVim$1(CodeMirror) {
           for (var i = 0; i < text.length; i++) {
             text[i] = (text[i] == '') ? ' ' : text[i];
           }
-          cur.ch += actionArgs.after ? 1 : 0;
+          cur.ch += actionArgs.after ? charWidthAt(cm, cur) : 0;
           cur.ch = Math.min(lineLength(cm, cur.line), cur.ch);
         } else if (linewise) {
           if(vim.visualMode) {
@@ -2829,7 +2856,7 @@ function initVim$1(CodeMirror) {
             cur.ch = 0;
           }
         } else {
-          cur.ch += actionArgs.after ? 1 : 0;
+          cur.ch += actionArgs.after ? charWidthAt(cm, cur) : 0;
         }
         var curPosFinal;
         var idx;
@@ -2848,7 +2875,10 @@ function initVim$1(CodeMirror) {
             lastSelectionCurEnd = vim.lastSelection.headMark.find();
           }
           // push the previously selected text to unnamed register
-          vimGlobalState.registerController.unnamedRegister.setText(selectedText);
+          if (actionArgs.after) {  // review-server: P keeps the register; p stores whole lines as lines
+            vimGlobalState.registerController.unnamedRegister.setText(
+                vim.visualLine && !/\n$/.test(selectedText) ? selectedText + '\n' : selectedText, !!vim.visualLine);
+          }
           if (blockwise) {
             // first delete the selected text
             cm.replaceSelections(emptyStrings);
@@ -2921,6 +2951,9 @@ function initVim$1(CodeMirror) {
         if (vim.visualMode) {
           exitVisualMode(cm, false);
         }
+        // review-server: ending on a pasted emoji means its start, not its second half
+        var pastedLine = cm.getLine(curPosFinal.line) || '';
+        if (/[\uDC00-\uDFFF]/.test(pastedLine.charAt(curPosFinal.ch)) && /[\uD800-\uDBFF]/.test(pastedLine.charAt(curPosFinal.ch - 1))) { curPosFinal.ch--; }
         cm.setCursor(curPosFinal);
       },
       undo: function(cm, actionArgs) {
@@ -2950,9 +2983,12 @@ function initVim$1(CodeMirror) {
           curEnd = cm.getCursor('end');
         } else {
           var line = cm.getLine(curStart.line);
-          replaceTo = curStart.ch + actionArgs.repeat;
+          replaceTo = curStart.ch;
+          for (var r = 0; r < actionArgs.repeat; r++) { replaceTo += /[\uD800-\uDBFF]/.test(line.charAt(replaceTo)) ? 2 : 1; }
+          // review-server: too few characters: r fails and changes nothing
           if (replaceTo > line.length) {
-            replaceTo=line.length;
+            vimGlobalState.macroModeState.failed = true;
+            return;
           }
           curEnd = new Pos(curStart.line, replaceTo);
         }
@@ -2963,7 +2999,7 @@ function initVim$1(CodeMirror) {
         } else {
           var replaceWithStr = cm.getRange(curStart, curEnd);
           //replace all characters in range by selected, but keep linebreaks
-          replaceWithStr = replaceWithStr.replace(/[^\n]/g, replaceWith);
+          replaceWithStr = replaceWithStr.replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]|[^\n]/g, replaceWith);
           if (vim.visualBlock) {
             // Tabs are split in visua block before replacing
             var spaces = new Array(cm.getOption("tabSize")+1).join(' ');
@@ -2979,7 +3015,8 @@ function initVim$1(CodeMirror) {
             cm.setCursor(curStart);
             exitVisualMode(cm, false);
           } else {
-            cm.setCursor(offsetCursor(curEnd, 0, -1));
+            // review-server: on the last new character, however wide the old ones were
+            cm.setCursor(new Pos(curStart.line, curStart.ch + replaceWithStr.length - replaceWith.length));
           }
         }
       },
@@ -3053,7 +3090,15 @@ function initVim$1(CodeMirror) {
       var line = Math.min(Math.max(cm.firstLine(), cur.line), cm.lastLine() );
       var maxCh = lineLength(cm, line) - 1 + !!includeLineBreak;
       var ch = Math.min(Math.max(0, cur.ch), maxCh);
+      // review-server: never in the middle of an emoji
+      var text = cm.getLine(line);
+      if (ch > 0 && /[\uDC00-\uDFFF]/.test(text.charAt(ch)) && /[\uD800-\uDBFF]/.test(text.charAt(ch - 1))) { ch--; }
       return new Pos(line, ch);
+    }
+    // review-server: an emoji takes two units, and nothing may land between them
+    function charWidthAt(cm, cur) {
+      var text = cm.getLine(cur.line) || '';
+      return /[\uD800-\uDBFF]/.test(text.charAt(cur.ch)) && /[\uDC00-\uDFFF]/.test(text.charAt(cur.ch + 1)) ? 2 : 1;
     }
     function copyArgs(args) {
       var ret = {};
@@ -3350,8 +3395,8 @@ function initVim$1(CodeMirror) {
       if (mode == 'char') {
         var headOffset = !exclusive && !cursorIsBefore(sel.head, sel.anchor) ? 1 : 0;
         var anchorOffset = cursorIsBefore(sel.head, sel.anchor) ? 1 : 0;
-        head = offsetCursor(sel.head, 0, headOffset);
-        anchor = offsetCursor(sel.anchor, 0, anchorOffset);
+        head = offsetCursor(sel.head, 0, headOffset && charWidthAt(cm, sel.head));
+        anchor = offsetCursor(sel.anchor, 0, anchorOffset && charWidthAt(cm, sel.anchor));
         return {
           ranges: [{anchor: anchor, head: head}],
           primary: 0
@@ -4497,9 +4542,11 @@ function initVim$1(CodeMirror) {
     // Translates a search string from ex (vim) syntax into javascript form.
     // review-server: Vim's patterns to JavaScript's, in place of the original, which knew only a few of them.
     // Handles \v \m \V \c \C \< \> \+ \? \= \| \( \) \%( \{n,m} \{-} \a \l \u \h \x and the like.
-    var vimClasses = {a: '[A-Za-z]', A: '[^A-Za-z]', l: '[a-z]', L: '[^a-z]', u: '[A-Z]', U: '[^A-Z]',
-      h: '[A-Za-z_]', H: '[^A-Za-z_]', x: '[0-9A-Fa-f]', X: '[^0-9A-Fa-f]', o: '[0-7]', O: '[^0-7]',
-      s: '[ \\t]', S: '[^ \\t]', W: '[^\\w\\n]', D: '[^\\d\\n]', e: '\\x1b', i: '[A-Za-z_]', I: '[^A-Za-z_]', k: '\\w', K: '[^\\w]', f: '\\S', F: '\\S', p: '\\S', P: '\\S'};
+    // review-server: no class here may match a line break: the search can run across lines, and Vim's never do
+    var WORD_CHARS = '\\w\\u00C0-\\u024F', WORD_START = '(?<![' + WORD_CHARS + '])(?=[' + WORD_CHARS + '])', WORD_END = '(?<=[' + WORD_CHARS + '])(?![' + WORD_CHARS + '])';
+    var vimClasses = {a: '[A-Za-z]', A: '[^A-Za-z\\n]', l: '[a-z]', L: '[^a-z\\n]', u: '[A-Z]', U: '[^A-Z\\n]',
+      h: '[A-Za-z_]', H: '[^A-Za-z_\\n]', x: '[0-9A-Fa-f]', X: '[^0-9A-Fa-f\\n]', o: '[0-7]', O: '[^0-7\\n]',
+      s: '[ \\t]', S: '[^ \\t\\n]', W: '[^\\w\\n]', D: '[^\\d\\n]', e: '\\x1b', i: '[' + WORD_CHARS + ']', I: '[A-Za-z_\\u00C0-\\u024F]', k: '[' + WORD_CHARS + ']', K: '[A-Za-z_\\u00C0-\\u024F]', f: '[^ \\t\\n]', F: '[^ \\t\\n0-9]', p: '[^\\x00-\\x1f\\n]', P: '[^\\x00-\\x1f\\n0-9]'};
     function translateRegex(str) {
       var out = [], veryMagic = false, noMagic = false, i = 0, ignore = null;
       var groups = [], lastGroup = -1, closing = 0;
@@ -4539,8 +4586,8 @@ function initVim$1(CodeMirror) {
           if (n == 'm' || n == 'M') { veryMagic = false; noMagic = n == 'M'; continue; }
           if (n == 'c') { ignore = true; continue; }
           if (n == 'C') { ignore = false; continue; }
-          if (n == '<') { out.push(veryMagic ? '<' : '\\b(?=\\w)'); continue; }
-          if (n == '>') { out.push(veryMagic ? '>' : '\\b(?<=\\w)'); continue; }
+          if (n == '<') { out.push(veryMagic ? '<' : WORD_START); continue; }
+          if (n == '>') { out.push(veryMagic ? '>' : WORD_END); continue; }
           if (n == '%' && str.charAt(i) == '(' && !veryMagic) { groups.push(out.length); out.push('(?:'); i++; continue; }
           if (n == 'z' && str.charAt(i) == 's') { out = ['(?<=' + out.join('') + ')']; groups = []; i++; continue; }
           if (n == 'z' && str.charAt(i) == 'e') { out.push('(?='); closing++; i++; continue; }
@@ -4587,8 +4634,8 @@ function initVim$1(CodeMirror) {
           continue;
         }
         if (veryMagic) {
-          if (c == '<') { out.push('\\b(?=\\w)'); continue; }
-          if (c == '>') { out.push('\\b(?<=\\w)'); continue; }
+          if (c == '<') { out.push(WORD_START); continue; }
+          if (c == '>') { out.push(WORD_END); continue; }
           if (c == '=') { out.push('?'); continue; }
           if (c == '@' && /^(=|!|<=|<!)/.test(str.slice(i))) {
             var vkind = /^(=|!|<=|<!)/.exec(str.slice(i))[1];
@@ -4637,48 +4684,25 @@ function initVim$1(CodeMirror) {
       }
       return out;
     }
+    // review-server: rewritten: \\t is a backslash and a t, as LaTeX needs, and only \t is a tab
     function translateRegexReplace(str) {
-      var escapeNextChar = false;
-      var out = [];
-      for (var i = -1; i < str.length; i++) {
-        var c = str.charAt(i) || '';
-        var n = str.charAt(i+1) || '';
-        if (!escapeNextChar && caseMarks[c + n]) {  // review-server: \U \L \E \u \l, applied after replacing
-          out.push(caseMarks[c + n]);
-          i++;
-        } else if (!escapeNextChar && c == '&') {  // review-server: & is the whole match, and \& a plain &
-          out.push('$&');
-        } else if (!escapeNextChar && c == '\\' && n == '&') {
-          out.push('&');
-          i++;
-        } else if (charUnescapes[c + n]) {
-          out.push(charUnescapes[c+n]);
-          i++;
-        } else if (escapeNextChar) {
-          // At any point in the loop, escapeNextChar is true if the previous
-          // character was a '\' and was not escaped.
-          out.push(c);
-          escapeNextChar = false;
-        } else {
-          if (c === '\\') {
-            escapeNextChar = true;
-            if ((isNumber(n) || n === '$')) {
-              out.push('$');
-            } else if (n !== '/' && n !== '\\') {
-              out.push('\\');
-            }
-          } else {
-            if (c === '$') {
-              out.push('$');
-            }
-            out.push(c);
-            if (n === '/') {
-              out.push('\\');
-            }
-          }
-        }
+      var out = '';
+      for (var i = 0; i < str.length; i++) {
+        var c = str.charAt(i);
+        if (c == '&') { out += '$&'; continue; }
+        if (c == '$') { out += '$$'; continue; }
+        if (c == '~') { out += vimGlobalState.lastSubstituteReplacePart || ''; continue; }
+        if (c != '\\' || i == str.length - 1) { out += c; continue; }
+        var n = str.charAt(++i);
+        if (caseMarks['\\' + n]) { out += caseMarks['\\' + n]; }
+        else if (n == '0') { out += '$&'; }
+        else if (isNumber(n)) { out += '$' + n; }
+        else if (n == 'r' || n == 'n') { out += '\n'; }
+        else if (n == 't') { out += '\t'; }
+        else if (n == '$') { out += '$$'; }
+        else { out += n; }
       }
-      return out.join('');
+      return out;
     }
 
     // Unescape \ and / in the replace part, for PCRE mode.
@@ -5574,8 +5598,18 @@ function initVim$1(CodeMirror) {
           if (getOption('pcre') && regexPart !== '') {
               regexPart = new RegExp(regexPart).source; //normalize not escaped characters
           }
-          replacePart = tokens[1];
+          // review-server: the delimiter can be escaped in both parts; a / in the pattern is then just a character
+          var delimiter = argString[0];
+          var unescapeDelimiter = function(t) {
+            return t.replace(/\\[\s\S]/g, function(m) { return m.charAt(1) == delimiter ? delimiter : m; });
+          };
+          if (!getOption('pcre')) {
+            regexPart = unescapeDelimiter(regexPart).replace(/\\[\s\S]|\//g, function(m) { return m == '/' ? '\\/' : m; });
+          }
+          // review-server: :s/foo with nothing after it deletes foo
+          replacePart = tokens[1] === undefined ? '' : tokens[1];
           if (replacePart !== undefined) {
+            if (!getOption('pcre')) { replacePart = unescapeDelimiter(replacePart); }
             if (getOption('pcre')) {
               replacePart = unescapeRegexReplace(replacePart.replace(/([^\\])&/g,"$1$$&"));
             } else {
@@ -5606,10 +5640,11 @@ function initVim$1(CodeMirror) {
             if (flagsPart.indexOf('g') != -1) {
               global = true;
             }
+            var countOnly = flagsPart.indexOf('n') != -1;  // review-server: n counts, and changes nothing
             if (getOption('pcre')) {
                regexPart = regexPart + '/' + flagsPart;
-            } else {
-               regexPart = regexPart.replace(/\//g, "\\/") + '/' + flagsPart;
+            } else if (flagsPart.indexOf('i') != -1) {
+               regexPart = regexPart + '/i';
             }
           }
         }
@@ -5624,7 +5659,8 @@ function initVim$1(CodeMirror) {
             return;
           }
         }
-        replacePart = replacePart || vimGlobalState.lastSubstituteReplacePart;
+        // review-server: an empty replacement is a replacement: :s/x// must not reuse the last one
+        if (replacePart === undefined) { replacePart = vimGlobalState.lastSubstituteReplacePart; }
         if (replacePart === undefined) {
           showConfirm(cm, 'No previous substitute regular expression');
           return;
@@ -5642,6 +5678,15 @@ function initVim$1(CodeMirror) {
         }
         var startPos = clipCursorToContent(cm, new Pos(lineStart, 0));
         var cursor = cm.getSearchCursor(query, startPos);
+        if (countOnly) {
+          var matches = 0, onLines = {}, lastLine = lineEnd === Infinity ? cm.lastLine() : lineEnd;
+          while (cursor.findNext() && cursor.from().line <= lastLine) {
+            if (global || !onLines[cursor.from().line]) { matches++; }
+            onLines[cursor.from().line] = true;
+          }
+          showConfirm(cm, matches + ' match' + (matches == 1 ? '' : 'es') + ' on ' + Object.keys(onLines).length + ' line' + (Object.keys(onLines).length == 1 ? '' : 's'));
+          return;
+        }
         doReplace(cm, confirm, global, lineStart, lineEnd, cursor, query, replacePart, params.callback);
       },
       redo: CodeMirror.commands.redo,
@@ -5745,7 +5790,7 @@ function initVim$1(CodeMirror) {
       // Set up all the functions.
       cm.state.vim.exMode = true;
       var done = false;
-      var lastPos, modifiedLineNumber, joined;
+      var lastPos, modifiedLineNumber, joined, lastEnd;
       function replaceAll() {
         cm.operation(function() {
           while (!done) {
@@ -5761,6 +5806,7 @@ function initVim$1(CodeMirror) {
         var unmodifiedLineNumber = searchCursor.to().line;
         searchCursor.replace(newText);
         modifiedLineNumber = searchCursor.to().line;
+        lastEnd = copyCursor(searchCursor.to());  // review-server: \r in the replacement moves the last line down
         lineEnd += modifiedLineNumber - unmodifiedLineNumber;
         joined = modifiedLineNumber < unmodifiedLineNumber;
       }
@@ -5793,7 +5839,7 @@ function initVim$1(CodeMirror) {
         cm.focus();
         if (lastPos) {
           // review-server: :s leaves the cursor at the start of the last line it changed
-          var endLine = Math.min(lastPos.line, cm.lastLine());
+          var endLine = Math.min((lastEnd || lastPos).line, cm.lastLine());
           cm.setCursor(endLine, findFirstNonWhiteSpaceCharacter(cm.getLine(endLine)));
           var vim = cm.state.vim;
           vim.exMode = false;
@@ -5936,7 +5982,7 @@ function initVim$1(CodeMirror) {
       for (var i = 0; i < keyBuffer.length; i++) {
         var text = keyBuffer[i];
         var match, key;
-        while (text) {
+        while (text && !macroModeState.failed) {
           // Pull off one command key, which is either a single character
           // or a special sequence wrapped in '<' and '>', e.g. '<Space>'.
           match = (/<\w+-.+?>|<\w+>|./).exec(text);
@@ -5944,6 +5990,7 @@ function initVim$1(CodeMirror) {
           text = text.substring(match.index + key.length);
           vimApi.handleKey(cm, key, 'macro');
           if (vim.insertMode) {
+            if (!register.insertModeChanges[imc]) { exitInsertMode(cm); macroModeState.failed = true; break; }  // review-server: yanked text, not a recording
             var changes = register.insertModeChanges[imc++].changes;
             vimGlobalState.macroModeState.lastInsertModeChanges.changes =
                 changes;

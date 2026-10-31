@@ -276,7 +276,7 @@
     nodes: new Map(),  // figures already built, kept so they need not load again
     addRef: null,
   };
-  const CM = '/static/codemirror/', CM_VERSION = '?v=3';   // these files are cached; raise this when they change
+  const CM = '/static/codemirror/', CM_VERSION = '?v=4';   // these files are cached; raise this when they change
   const pref = {
     get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
     set(k, v) { try { localStorage.setItem(k, v); } catch (e) { /* not remembered */ } },

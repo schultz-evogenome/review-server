@@ -15,3 +15,11 @@ python3 analyze.py cm.json
 ```
 
 `analyze.py` prints how many sequences differ, grouped by command. It leaves out commands that depend on the size of the window. Vim merges undo steps when it reads keys from a script, so sequences with several undoable commands before a `u` are left out too.
+
+`cases_editing.py` has about 230 more, for substitutes, macros, `gq`, `:normal`, marks, undo steps, and emoji. They run through Vim in a terminal, so keys count as typed and undo steps are real:
+
+```
+python3 cases_editing.py && python3 run_vim_pty.py
+node compare.mjs 18810 cm.json
+python3 differences.py
+```
