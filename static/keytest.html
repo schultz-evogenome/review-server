@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Key test</title>
+<link rel="stylesheet" href="/static/codemirror/lib/codemirror.css?v=2">
+<link rel="stylesheet" href="/static/codemirror/addon/dialog/dialog.css?v=2">
+<link rel="stylesheet" href="/static/app.css">
+<style>
+  #kt { max-width: 780px; margin: 0 auto; padding: 14px 16px 0; font-size: 15px; }
+  #kt h1 { font-size: 18px; margin: 0 0 4px; }
+  #kt ol { margin: 8px 0; padding-left: 22px; }
+  #kt textarea { display: block; width: 100%; font: inherit; padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); color: var(--fg); }
+  #ktStatus { position: fixed; right: 12px; bottom: 10px; z-index: 30; font-size: 13px; color: var(--muted); }
+</style>
+</head>
+<body class="writing">
+<section id="kt">
+  <h1>Key test</h1>
+  <p class="muted">This page records the keys you press on this page and where the cursor goes, and saves them on the server so they can be looked at. It records nothing anywhere else. The text below is a throwaway sample; nothing here is saved to any document.</p>
+  <ol>
+    <li>Click in the text below.</li>
+    <li>Hold <b>j</b> for about five seconds, then let go.</li>
+    <li>Hold <b>k</b> for about five seconds, then let go.</li>
+    <li>Tap <b>j</b> ten times, at your normal speed.</li>
+    <li>Do whatever else felt wrong. Then describe it here:</li>
+  </ol>
+  <textarea id="ktNote" rows="2" placeholder="What went wrong, in your own words (optional)"></textarea>
+</section>
+<main id="editor"></main>
+<div id="vimMode"></div>
+<div id="ktStatus"></div>
+<script src="/static/codemirror/lib/codemirror.js?v=2"></script>
+<script src="/static/codemirror/addon/search/searchcursor.js?v=2"></script>
+<script src="/static/codemirror/addon/dialog/dialog.js?v=2"></script>
+<script src="/static/codemirror/addon/edit/matchbrackets.js?v=2"></script>
+<script src="/static/codemirror/keymap/vim.js?v=2"></script>
+<script src="/static/codemirror/mode/markdown/markdown.js?v=2"></script>
+<script src="/static/vim-fixes.js"></script>
+<script src="/static/keytest.js"></script>
+</body>
+</html>

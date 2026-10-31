@@ -288,7 +288,7 @@
       document.head.insertBefore(l, $('link[href="/static/app.css"]'));   // app.css keeps the last word
     });
     const js = ['lib/codemirror.js', 'addon/search/searchcursor.js', 'addon/dialog/dialog.js', 'addon/edit/matchbrackets.js',
-      'keymap/vim.js', 'mode/markdown/markdown.js', 'mode/stex/stex.js', '../vim-fixes.js'];
+      'keymap/vim.js', 'mode/markdown/markdown.js', 'mode/stex/stex.js', '../vim-fixes.js', '../marked/marked.min.js'];
     cmReady = js.reduce((p, f) => p.then(() => new Promise((ok, no) => {
       const s = document.createElement('script');
       s.src = CM + f + CM_VERSION; s.onload = ok; s.onerror = () => no(new Error('could not load ' + f));
@@ -338,12 +338,18 @@
     T.cm.on('vim-mode-change', e => showVimMode(e.mode + (e.subMode ? ' ' + e.subMode : '')));
     showVimMode('normal');
     refreshChanges(); refreshImages(); updateWords();
+    T.cm.on('cursorActivity', () => { clearTimeout(PV.syncTimer); PV.syncTimer = setTimeout(syncPreview, 80); });
+    PV.figures = new Map();
+    $('#previewBtn').hidden = !isMarkdown();
+    setPreview(isMarkdown() && pref.get('review.preview') === '1');
     setStatus(t.edited ? 'Saved' : '');
     if (!S.reopen && window.matchMedia('(pointer: fine)').matches) T.cm.focus();
   }
 
   function closeText() {
-    stopHold();
+    if (window.reviewVim) window.reviewVim.detach();
+    setPreview(false);
+    $('#previewBtn').hidden = true;
     clearTimeout(T.timer); clearTimeout(T.refreshTimer);
     T.cm = null; T.dirty = false; T.conflict = null;
     $('#editor').innerHTML = ''; $('#editor').hidden = true; $('#textTools').hidden = true;
@@ -363,35 +369,6 @@
     showVimMode('normal');
     T.cm.focus();
   });
-
-  // Holding a movement key. Browsers are unreliable here: on a Mac, Chrome can send one repeat and then none. So the
-  // page does all the repeating itself, ignores the browser's repeats, and stops only when the key is let go. Only
-  // keys that move: if a key release were ever lost, these would just stop at the end of the file, where a repeating
-  // x would keep deleting.
-  const HOLD_KEYS = 'hjklwbeWBE{}';
-  const HOLD_WAIT = 280, HOLD_EVERY = 30;
-  let holdTimer = null, holdKey = null;
-  function stopHold() { clearTimeout(holdTimer); clearInterval(holdTimer); holdTimer = null; holdKey = null; }
-  document.addEventListener('keydown', e => {
-    if (e.repeat && e.key === holdKey) { e.preventDefault(); e.stopPropagation(); return; }
-    stopHold();
-    if (!T.cm || !$('#vimOn').checked || e.ctrlKey || e.metaKey || e.altKey || !HOLD_KEYS.includes(e.key)) return;
-    if (!T.cm.getWrapperElement().contains(e.target) || e.target.closest('.CodeMirror-dialog')) return;
-    const cm = T.cm, vim = cm.state.vim;       // this runs before the editor sees the key
-    if (!vim || vim.insertMode || vim.inputState.operator || vim.inputState.keyBuffer.length) return;
-    const key = e.key;
-    holdKey = key;
-    holdTimer = setTimeout(() => {
-      holdTimer = setInterval(() => {
-        if (T.cm !== cm || vim.insertMode) { stopHold(); return; }
-        CodeMirror.Vim.handleKey(cm, key, 'user');
-      }, HOLD_EVERY);
-    }, HOLD_WAIT);
-  }, true);
-  document.addEventListener('keyup', e => { if (e.key === holdKey || e.key === 'Shift') stopHold(); }, true);
-  document.addEventListener('pointerdown', stopHold, true);
-  window.addEventListener('blur', stopHold);
-  document.addEventListener('visibilitychange', stopHold);
 
   // The toolbar slides away while typing and comes back when the pointer or a finger moves.
   function showBarAgain(e) {
@@ -416,7 +393,7 @@
     clearTimeout(T.timer);
     T.timer = setTimeout(saveText, 600);
     clearTimeout(T.refreshTimer);
-    T.refreshTimer = setTimeout(() => { if (T.cm) { refreshChanges(); refreshImages(); updateWords(); } }, 250);
+    T.refreshTimer = setTimeout(() => { if (T.cm) { refreshChanges(); refreshImages(); updateWords(); renderPreview(); } }, 250);
   }
 
   function updateWords() {
@@ -508,34 +485,40 @@
     return out;
   }
 
+  // What differs from the file as queued: changed spans, and the places where text was removed.
+  function changedSpans(now) {
+    const spans = [], gone = [];
+    for (const [a0, a1, b0, b1] of diffSeq(T.origLines, now)) {
+      if (a1 - a0 === b1 - b0) {
+        for (let k = 0; k < b1 - b0; k++) {
+          const A = T.origLines[a0 + k].split(/(\s+)/), B = now[b0 + k].split(/(\s+)/), at = [0];
+          B.forEach(x => at.push(at[at.length - 1] + x.length));
+          for (const [, , w0, w1] of diffSeq(A, B)) {
+            if (at[w1] > at[w0]) spans.push({ line: b0 + k, from: at[w0], to: at[w1] });
+            else gone.push({ line: b0 + k, ch: at[w0] });
+          }
+        }
+      } else if (b1 > b0) {
+        for (let l = b0; l < b1; l++) if (now[l]) spans.push({ line: l, from: 0, to: now[l].length });
+      } else {
+        gone.push({ line: Math.min(b0, now.length - 1), ch: 0 });
+      }
+    }
+    return { spans, gone };
+  }
+
   // Tint what differs from the file as queued, and leave a small tick where text was removed.
   function refreshChanges() {
     const cm = T.cm;
-    const gone = (line, ch) => {
-      const w = document.createElement('span');
-      w.className = 'cm-gone';
-      T.marks.push(cm.setBookmark({ line, ch }, { widget: w }));
-    };
-    const tint = (from, to) => T.marks.push(cm.markText(from, to, { className: 'cm-changed' }));
     cm.operation(() => {
       T.marks.forEach(m => m.clear());
       T.marks = [];
-      const now = cm.getValue('\n').split('\n');
-      for (const [a0, a1, b0, b1] of diffSeq(T.origLines, now)) {
-        if (a1 - a0 === b1 - b0) {
-          for (let k = 0; k < b1 - b0; k++) {
-            const A = T.origLines[a0 + k].split(/(\s+)/), B = now[b0 + k].split(/(\s+)/), at = [0];
-            B.forEach(x => at.push(at[at.length - 1] + x.length));
-            for (const [, , w0, w1] of diffSeq(A, B)) {
-              if (at[w1] > at[w0]) tint({ line: b0 + k, ch: at[w0] }, { line: b0 + k, ch: at[w1] });
-              else gone(b0 + k, at[w0]);
-            }
-          }
-        } else if (b1 > b0) {
-          tint({ line: b0, ch: 0 }, { line: b1 - 1, ch: now[b1 - 1].length });
-        } else {
-          gone(Math.min(b0, now.length - 1), 0);
-        }
+      const { spans, gone } = changedSpans(cm.getValue('\n').split('\n'));
+      for (const x of spans) T.marks.push(cm.markText({ line: x.line, ch: x.from }, { line: x.line, ch: x.to }, { className: 'cm-changed' }));
+      for (const x of gone) {
+        const w = document.createElement('span');
+        w.className = 'cm-gone';
+        T.marks.push(cm.setBookmark({ line: x.line, ch: x.ch }, { widget: w }));
       }
     });
   }
@@ -683,12 +666,146 @@
       if (!r.ok) throw new Error(body.error || r.statusText);
       T.images = body.images;
       Array.from(T.nodes.keys()).filter(k => k.startsWith(ref + '#')).forEach(k => T.nodes.delete(k));
+      Array.from(PV.figures.keys()).filter(k => k.startsWith(ref + '#')).forEach(k => PV.figures.delete(k));
       T.imgKey = '';
       refreshImages();
+      renderPreview();
       toast('Image added');
     } catch (e) {
       toast('Could not add it: ' + e.message, 5000);
     }
+  });
+
+  // ------------------------------------------------------------ live preview of Markdown
+
+  // The Markdown is rendered in the browser whenever typing pauses, a top-level block at a time, so each block knows
+  // its source lines. Changed text is marked by private-use characters put into the source before rendering, and
+  // those become <mark> afterwards. Raw HTML from the file is shown as text, never run.
+  const PV = { on: false, blocks: [], figures: new Map(), syncTimer: null, ready: false };
+  const MARK_START = '', MARK_END = '', MARK_GONE = '';
+  const noMarks = s => String(s || '').replace(/[-]|%EE%80%9[0-2]/gi, '');
+  const isMarkdown = () => !!S.item && /\.(md|markdown)$/i.test(S.item.file || '');
+
+  // Turn the bits of LaTeX that Markdown drafts carry into HTML. Takes text that is already escaped.
+  function latexInline(html) {
+    for (let i = 0; i < 4; i++) {
+      html = html.replace(/\\textbf\{([^{}]*)\}/g, '<b>$1</b>').replace(/\\(?:emph|textit)\{([^{}]*)\}/g, '<i>$1</i>')
+        .replace(/\\texttt\{([^{}]*)\}/g, '<code>$1</code>');
+    }
+    return html.replace(/\\([%&_#$])/g, '$1');
+  }
+  function figurePlaceholder(ref, alt) {
+    return '<span class="pv-fig" data-ref="' + esc(noMarks(ref)) + '" data-alt="' + esc(noMarks(alt)) + '"></span>';
+  }
+  // A raw LaTeX block: show its figures and captions, and leave out layout commands.
+  function latexBlock(code) {
+    const figs = [];
+    const rest = code.replace(/\\includegraphics\s*(?:\[[^\]]*\]\s*)?\{([^}]+)\}/g, (_m, ref) => { figs.push(ref.trim()); return ''; })
+      .replace(/\\(?:begin|end)\{[^}]*\}(?:\[[^\]]*\])?/g, '').replace(/\\(?:vspace|hspace|label)\*?\{[^}]*\}/g, '')
+      .replace(/\\(?:centering|raggedright|par|newpage|noindent|clearpage|smallskip|medskip|bigskip)\b/g, '');
+    const caption = latexInline(esc(rest)).replace(/[{}]/g, '').replace(/~/g, ' ').trim();
+    if (!figs.length && !noMarks(caption).trim()) return '';
+    return '<div class="pv-latex">' + figs.map(r => figurePlaceholder(r, '')).join('') + (noMarks(caption).trim() ? '<p class="pv-caption">' + caption + '</p>' : '') + '</div>';
+  }
+  function setUpMarked() {
+    if (PV.ready) return;
+    PV.ready = true;
+    marked.use({ renderer: {
+      html(html) {
+        const img = /<img\b[^>]*\bsrc\s*=\s*["']([^"']+)["']/i.exec(html);
+        return img ? figurePlaceholder(img[1], '') : esc(html);
+      },
+      code(code, lang) {
+        return /^\{?=?latex\}?/.test(lang || '') ? latexBlock(code) : '<pre><code>' + esc(code) + '</code></pre>';
+      },
+      link(href, title, text) {
+        const url = noMarks(href);
+        if (!/^(https?:|mailto:|#)/i.test(url)) return text;
+        return '<a href="' + esc(url) + '" target="_blank" rel="noopener noreferrer">' + text + '</a>';
+      },
+      image(href, title, text) {
+        let ref = noMarks(href);
+        try { ref = decodeURI(ref); } catch (e) { /* as written */ }
+        return figurePlaceholder(ref, text);
+      },
+    } });
+  }
+  // The source with its changes marked, keeping line starts as they are so that lists and headings still parse.
+  function markedSource(lines) {
+    const { spans, gone } = changedSpans(lines);
+    const edits = new Map();
+    const add = (line, at, text, order) => { if (!edits.has(line)) edits.set(line, []); edits.get(line).push({ at, text, order }); };
+    for (const x of spans) {
+      const lead = x.from === 0 ? /^\s*(?:(?:[-*+]|\d+[.)]|#{1,6}|>)\s+)*/.exec(lines[x.line])[0].length : x.from;
+      if (lead >= x.to) continue;
+      add(x.line, lead, MARK_START, 1);
+      add(x.line, x.to, MARK_END, 0);
+    }
+    for (const x of gone) if (lines[x.line]) add(x.line, x.ch, MARK_GONE, 2);
+    return lines.map((text, n) => {
+      const list = edits.get(n);
+      if (!list) return text;
+      list.sort((p, q) => q.at - p.at || q.order - p.order);
+      for (const e of list) text = text.slice(0, e.at) + e.text + text.slice(e.at);
+      return text;
+    }).join('\n');
+  }
+  function renderPreview() {
+    if (!PV.on || !T.cm) return;
+    setUpMarked();
+    const box = $('#preview'), top = box.scrollTop;
+    const tokens = marked.lexer(markedSource(T.cm.getValue('\n').split('\n')));
+    let line = 0, html = '';
+    PV.blocks = [];
+    for (const t of tokens) {
+      const count = ((t.raw || '').match(/\n/g) || []).length;
+      if (t.type !== 'space') {
+        const end = line + Math.max(0, count - (/\n$/.test(t.raw || '') ? 1 : 0));
+        html += '<div class="pv-block" data-from="' + line + '" data-to="' + end + '">' + latexInline(marked.parser([t])) + '</div>';
+      }
+      line += count;
+    }
+    box.innerHTML = html.split(MARK_START).join('<mark class="pv-new">').split(MARK_END).join('</mark>')
+      .split(MARK_GONE).join('<span class="pv-gone"></span>');
+    const seen = {};
+    $$('.pv-fig', box).forEach(el => {
+      const ref = el.dataset.ref, alt = el.dataset.alt;
+      seen[ref] = (seen[ref] || 0) + 1;
+      const key = ref + '#' + seen[ref];
+      if (!PV.figures.has(key)) PV.figures.set(key, buildFigure({ ref, alt }));
+      el.replaceWith(PV.figures.get(key));
+    });
+    box.scrollTop = top;
+    syncPreview();
+  }
+  // Keep the block with the cursor in view.
+  function syncPreview() {
+    if (!PV.on || !T.cm) return;
+    const line = T.cm.getCursor().line, box = $('#preview');
+    const blocks = $$('.pv-block', box);
+    let found = null;
+    for (const b of blocks) {
+      if (Number(b.dataset.from) > line) break;
+      found = b;
+    }
+    if (!found) return;
+    const r = found.getBoundingClientRect(), b = box.getBoundingClientRect(), pad = 90;
+    if (r.top < b.top + pad || r.top > b.bottom - pad * 2) box.scrollTop += r.top - b.top - pad - 30;
+  }
+  function setPreview(on) {
+    PV.on = !!on;
+    document.body.classList.toggle('previewing', PV.on);
+    const box = $('#preview'), btn = $('#previewBtn');
+    box.hidden = !PV.on;
+    btn.classList.toggle('on', PV.on);
+    btn.setAttribute('aria-pressed', String(PV.on));
+    if (!PV.on) { box.innerHTML = ''; }
+    if (T.cm) T.cm.refresh();
+    if (PV.on) renderPreview();
+  }
+  $('#previewBtn').addEventListener('click', () => {
+    setPreview(!PV.on);
+    pref.set('review.preview', PV.on ? '1' : '0');
   });
 
   // ------------------------------------------------------------ viewer
@@ -1469,7 +1586,7 @@
   });
 
   // test hook for automated checks
-  window.__review = { S, T, boundaryAt, rangeBetween, addFromRange, rangeText, rangeParts, save, flush };
+  window.__review = { S, T, PV, boundaryAt, rangeBetween, addFromRange, rangeText, rangeParts, save, flush };
 
   route();
 })();

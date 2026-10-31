@@ -975,6 +975,8 @@ def make_handler(store, token):
                 return self.static('index.html')
             if parts[0] == 'static':
                 return self.static('/'.join(parts[1:]))
+            if parts == ['keytest']:
+                return self.static('keytest.html')
             if parts[:2] != ['api', 'items']:
                 return self.json_reply(404, {'error': 'not found'})
             if len(parts) == 2:
@@ -1081,6 +1083,8 @@ def make_handler(store, token):
                 return
             if parts == ['api', 'queue']:
                 return self.upload()
+            if parts == ['api', 'keylog']:
+                return self.save_keylog()
             if parts[:2] != ['api', 'items'] or parts[3:] not in (['done'], ['audio'], ['images']):
                 return self.json_reply(404, {'error': 'not found'})
             found = self.item(parts)
@@ -1125,6 +1129,22 @@ def make_handler(store, token):
             if not store.supersede(iid, item, n, automatic=False):
                 return self.json_reply(409, {'error': 'the reviewer has marked it done; Reopen it first'})
             self.json_reply(200, {'item': summary(root, item)})
+
+        def save_keylog(self):
+            """Keep what the /keytest page recorded, to see what a real keyboard sends. Only that page uses this."""
+            session = (self._query.get('session', ['']) or [''])[0]
+            if not re.match(r'^[0-9-]{1,40}$', session):
+                return self.json_reply(400, {'error': 'which session is this?'})
+            if len(self._body) > MAX_TEXT:
+                return self.json_reply(413, {'error': 'too long'})
+            try:
+                data = self.body()
+            except ValueError as e:
+                return self.json_reply(400, {'error': str(e)})
+            folder = (store.state.parent if store.state else Path.home() / '.config' / 'review-server') / 'keylogs'
+            folder.mkdir(parents=True, exist_ok=True)
+            write_json(folder / (session + '.json'), data)
+            self.json_reply(200, {'saved': session})
 
         def upload(self):
             if not store.inbox:

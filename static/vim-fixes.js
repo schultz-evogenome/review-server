@@ -346,6 +346,37 @@ window.reviewVim = (function () {
     }
   }, true);
 
+  // ------------------------------------------------------------ holding a key
+
+  // Holding a movement key. Browsers are unreliable here: on a Mac, Chrome can send one repeat and then none. So the
+  // page does all the repeating itself, ignores the browser's repeats, and stops only when the key is let go. Only
+  // keys that move: if a key release were ever lost, these would just stop at the end of the file, where a repeating
+  // x would keep deleting.
+  const HOLD_KEYS = 'hjklwbeWBE{}';
+  const HOLD_WAIT = 280, HOLD_EVERY = 30;
+  let holdTimer = null, holdKey = null;
+  function stopHold() { clearTimeout(holdTimer); clearInterval(holdTimer); holdTimer = null; holdKey = null; }
+  document.addEventListener('keydown', e => {
+    if (e.repeat && e.key === holdKey) { e.preventDefault(); e.stopPropagation(); return; }
+    stopHold();
+    if (!current || current.getOption('keyMap') !== 'vim' || e.ctrlKey || e.metaKey || e.altKey || !HOLD_KEYS.includes(e.key)) return;
+    if (!current.getWrapperElement().contains(e.target) || e.target.closest('.CodeMirror-dialog')) return;
+    const cm = current, vim = cm.state.vim;    // this runs before the editor sees the key
+    if (!vim || vim.insertMode || vim.inputState.operator || vim.inputState.keyBuffer.length) return;
+    const key = e.key;
+    holdKey = key;
+    holdTimer = setTimeout(() => {
+      holdTimer = setInterval(() => {
+        if (current !== cm || vim.insertMode) { stopHold(); return; }
+        Vim.handleKey(cm, key, 'user');
+      }, HOLD_EVERY);
+    }, HOLD_WAIT);
+  }, true);
+  document.addEventListener('keyup', e => { if (e.key === holdKey || e.key === 'Shift') stopHold(); }, true);
+  document.addEventListener('pointerdown', stopHold, true);
+  window.addEventListener('blur', stopHold);
+  document.addEventListener('visibilitychange', stopHold);
+
   // ------------------------------------------------------------ the system clipboard, for "+ and "*
 
   function clipboardRegister() {
@@ -509,6 +540,7 @@ window.reviewVim = (function () {
         Vim.defineEx(name, short, () => hooks.leave());
       });
     },
+    detach() { stopHold(); current = null; },
     // For each editor.
     attach(cm) {
       current = cm;

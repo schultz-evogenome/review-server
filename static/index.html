@@ -38,6 +38,7 @@
     <label class="check"><input type="checkbox" id="vimOn"> Vim keys</label>
     <span id="wordCount" class="muted"></span>
     <span class="spacer"></span>
+    <button id="previewBtn" hidden title="Show the Markdown rendered, beside the text">Preview</button>
     <button id="imagesBtn" hidden>Images</button>
     <button id="revertBtn" title="Go back to the file as queued">Revert</button>
   </div>
@@ -95,6 +96,8 @@
 <aside id="list" hidden aria-label="Highlights"></aside>
 
 <aside id="imagesPanel" hidden aria-label="Images"></aside>
+
+<aside id="preview" hidden aria-label="Preview"></aside>
 
 <section id="addPanel" hidden aria-label="Add a PDF">
   <h2>Add to the queue</h2>

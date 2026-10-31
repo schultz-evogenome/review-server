@@ -388,6 +388,14 @@ class TextFiles(Base):
             self.assertTrue(r.headers['Content-Type'].startswith('text/plain'))
             self.assertEqual(r.headers['X-Content-Type-Options'], 'nosniff')
 
+    def test_keylog(self):
+        self.assertEqual(self.call('POST', '/api/keylog?session=../evil', {'a': 1})[0], 400)
+        self.assertEqual(self.call('POST', '/api/keylog?session=123', b'not json', 'application/json')[0], 400)
+        self.assertEqual(self.call('POST', '/api/keylog?session=123-4', {'events': [1]})[0], 200)
+        self.assertEqual(json.loads((self.state.parent / 'keylogs' / '123-4.json').read_text()), {'events': [1]})
+        with urllib.request.urlopen(self.base + '/keytest') as r:
+            self.assertIn('Key test', r.read().decode())
+
     def test_image_references(self):
         refs = review.image_refs
         self.assertEqual(refs('a.md', '![x](fig/b.png "t")\n<img src="c.jpg">\n![](d.png)\n![](data:image/png;base64,AA)\n'
