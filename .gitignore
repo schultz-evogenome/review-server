@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 *.tmp
+tools/vim-compare/node_modules/
+tools/vim-compare/*.json
+tools/vim-compare/profile-*/

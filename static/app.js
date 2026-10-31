@@ -273,7 +273,7 @@
     nodes: new Map(),  // figures already built, kept so they need not load again
     addRef: null,
   };
-  const CM = '/static/codemirror/';
+  const CM = '/static/codemirror/', CM_VERSION = '?v=2';   // these files are cached; raise this when they change
   const pref = {
     get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
     set(k, v) { try { localStorage.setItem(k, v); } catch (e) { /* not remembered */ } },
@@ -288,17 +288,16 @@
       document.head.insertBefore(l, $('link[href="/static/app.css"]'));   // app.css keeps the last word
     });
     const js = ['lib/codemirror.js', 'addon/search/searchcursor.js', 'addon/dialog/dialog.js', 'addon/edit/matchbrackets.js',
-      'keymap/vim.js', 'mode/markdown/markdown.js', 'mode/stex/stex.js'];
+      'keymap/vim.js', 'mode/markdown/markdown.js', 'mode/stex/stex.js', '../vim-fixes.js'];
     cmReady = js.reduce((p, f) => p.then(() => new Promise((ok, no) => {
       const s = document.createElement('script');
-      s.src = CM + f; s.onload = ok; s.onerror = () => no(new Error('could not load ' + f));
+      s.src = CM + f + CM_VERSION; s.onload = ok; s.onerror = () => no(new Error('could not load ' + f));
       document.head.appendChild(s);
     })), Promise.resolve()).then(() => {
-      CodeMirror.commands.save = () => saveNow();
-      const leave = async () => { await flushText(); if (!T.conflict && !T.dirty) location.hash = '#/'; };
-      CodeMirror.Vim.defineEx('quit', 'q', leave);
-      CodeMirror.Vim.defineEx('wq', 'wq', leave);
-      CodeMirror.Vim.defineEx('xit', 'x', leave);
+      window.reviewVim.install({
+        save: saveNow,
+        leave: async () => { await flushText(); if (!T.conflict && !T.dirty) location.hash = '#/'; },
+      });
     }).catch(e => { cmReady = null; throw e; });
     return cmReady;
   }
@@ -313,13 +312,15 @@
     if (token !== S.loadToken) return;
     $('#editor').innerHTML = '';
     const t = data.text, name = t.name.toLowerCase();
-    T.sha = t.sha256; T.original = t.original; T.origLines = t.original.split(/\r\n?|\n/);
+    // A file's last line break ends its last line, as in Vim; it is not one more empty line to land on.
+    T.sha = t.sha256; T.original = t.original; T.origLines = t.original.replace(/\r?\n$/, '').split(/\r\n?|\n/);
+    T.endsInBreak = /\n$/.test(t.current);
     T.crlf = /\r\n/.test(t.current); T.images = t.images || {};
     T.conflict = null; T.dirty = false; T.refs = []; T.imgKey = ''; T.nodes = new Map(); T.marks = [];
     $('#conflict').hidden = true;
     $('#vimOn').checked = pref.get('review.vim') === '1';
     T.cm = CodeMirror($('#editor'), {
-      value: t.current,
+      value: t.current.replace(/\r?\n$/, ''),
       mode: /\.tex$/.test(name) ? 'stex' : /\.(md|markdown)$/.test(name) ? { name: 'markdown', highlightFormatting: true } : null,
       theme: 'goyo',
       keyMap: $('#vimOn').checked ? 'vim' : 'default',
@@ -333,6 +334,7 @@
       readOnly: S.reopen,
     });
     T.cm.on('change', onTextChange);
+    window.reviewVim.attach(T.cm);
     T.cm.on('vim-mode-change', e => showVimMode(e.mode + (e.subMode ? ' ' + e.subMode : '')));
     showVimMode('normal');
     refreshChanges(); refreshImages(); updateWords();
@@ -341,6 +343,7 @@
   }
 
   function closeText() {
+    stopHold();
     clearTimeout(T.timer); clearTimeout(T.refreshTimer);
     T.cm = null; T.dirty = false; T.conflict = null;
     $('#editor').innerHTML = ''; $('#editor').hidden = true; $('#textTools').hidden = true;
@@ -361,6 +364,33 @@
     T.cm.focus();
   });
 
+  // Holding a movement key. Macs and iPads often send no repeats for letter keys in a text field, so the page
+  // repeats the key itself, and steps aside if the browser does send them. Only keys that move: if a key release
+  // were ever lost, these would just stop at the end of the file, where a repeating x would keep deleting.
+  const HOLD_KEYS = 'hjklwbeWBE{}';
+  const HOLD_WAIT = 280, HOLD_EVERY = 30, HOLD_MOST = 20000;
+  let holdTimer = null, holdKey = null;
+  function stopHold() { clearTimeout(holdTimer); clearInterval(holdTimer); holdTimer = null; holdKey = null; }
+  document.addEventListener('keydown', e => {
+    stopHold();
+    if (e.repeat || !T.cm || !$('#vimOn').checked || e.ctrlKey || e.metaKey || e.altKey || !HOLD_KEYS.includes(e.key)) return;
+    if (!T.cm.getWrapperElement().contains(e.target) || e.target.closest('.CodeMirror-dialog')) return;
+    const cm = T.cm, vim = cm.state.vim;       // this runs before the editor sees the key
+    if (!vim || vim.insertMode || vim.inputState.operator || vim.inputState.keyBuffer.length) return;
+    const key = e.key, started = Date.now();
+    holdKey = key;
+    holdTimer = setTimeout(() => {
+      holdTimer = setInterval(() => {
+        if (T.cm !== cm || vim.insertMode || Date.now() - started > HOLD_MOST) { stopHold(); return; }
+        CodeMirror.Vim.handleKey(cm, key, 'user');
+      }, HOLD_EVERY);
+    }, HOLD_WAIT);
+  }, true);
+  document.addEventListener('keyup', e => { if (e.key === holdKey || e.key === 'Shift') stopHold(); }, true);
+  document.addEventListener('pointerdown', stopHold, true);
+  window.addEventListener('blur', stopHold);
+  document.addEventListener('visibilitychange', stopHold);
+
   // The toolbar slides away while typing and comes back when the pointer or a finger moves.
   function showBarAgain(e) {
     if (e.type === 'mousemove' && Math.abs(e.movementX) + Math.abs(e.movementY) < 3) return;
@@ -373,7 +403,8 @@
   function editorText() {
     const nl = T.cm.getValue('\n');
     if (nl === T.origLines.join('\n')) return T.original;      // exactly as queued, whatever its line endings
-    return T.crlf ? T.cm.getValue('\r\n') : nl;
+    const end = T.endsInBreak ? (T.crlf ? '\r\n' : '\n') : '';
+    return (T.crlf ? T.cm.getValue('\r\n') : nl) + end;
   }
 
   function onTextChange() {
@@ -439,7 +470,8 @@
     const server = T.conflict;
     T.conflict = null;
     $('#conflict').hidden = true;
-    T.cm.setValue(server.current);                      // Undo still brings your text back
+    T.endsInBreak = /\n$/.test(server.current);
+    T.cm.setValue(server.current.replace(/\r?\n$/, ''));   // Undo still brings your text back
     T.sha = server.sha256;
   });
 

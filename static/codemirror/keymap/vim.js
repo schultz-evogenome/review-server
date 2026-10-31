@@ -1450,7 +1450,7 @@ function initVim$1(CodeMirror) {
               showPrompt(cm, {
                   onClose: onPromptClose,
                   prefix: promptPrefix,
-                  desc: '(JavaScript regexp)',
+                  desc: getOption('pcre') ? '(JavaScript regexp)' : '',
                   onKeyUp: onPromptKeyUp,
                   onKeyDown: onPromptKeyDown
               });
@@ -1549,7 +1549,14 @@ function initVim$1(CodeMirror) {
         var sel = vim.sel;
         // TODO: Make sure cm and vim selections are identical outside visual mode.
         var origHead = copyCursor(vim.visualMode ? clipCursorToContent(cm, sel.head): cm.getCursor('head'));
+        // review-server: d* and the like start from where the cursor was, not from the start of the word
+        if (operator && !vim.visualMode && vimGlobalState.jumpList.cachedCursor) {
+          origHead = copyCursor(vimGlobalState.jumpList.cachedCursor);
+        }
         var origAnchor = copyCursor(vim.visualMode ? clipCursorToContent(cm, sel.anchor) : cm.getCursor('anchor'));
+        if (operator && !vim.visualMode && vimGlobalState.jumpList.cachedCursor) {
+          origAnchor = copyCursor(vimGlobalState.jumpList.cachedCursor);
+        }
         var oldHead = copyCursor(origHead);
         var oldAnchor = copyCursor(origAnchor);
         var newHead, newAnchor;
@@ -1584,6 +1591,20 @@ function initVim$1(CodeMirror) {
           if (!motionResult) {
             return;
           }
+          // review-server: a move that cannot go anywhere cancels the operator (cb at the top of the file, ch in column 1)
+          if (operator && !vim.visualMode && !(motionResult instanceof Array) && cursorEqual(motionResult, origHead) &&
+              (motion == 'moveToSymbol' || !motionArgs.forward && (motion == 'moveByCharacters' || motion == 'moveByWords'))) {
+            return;
+          }
+          // review-server: ) to the end of the file takes the last character too
+          if (motion == 'moveBySentence' && motionArgs.forward && operator && !(motionResult instanceof Array) &&
+              motionResult.line == cm.lastLine() && motionResult.ch >= lineLength(cm, motionResult.line) - 1) {
+            motionResult = new Pos(motionResult.line, lineLength(cm, motionResult.line));
+          }
+          // review-server: cw on an empty line changes that line, not the line break after it
+          if (operator == 'change' && motion == 'moveByWords' && motionArgs.forward && !motionArgs.wordEnd && !cm.getLine(origHead.line)) {
+            motionResult = copyCursor(origHead);
+          }
           if (motionArgs.toJumplist) {
             var jumpList = vimGlobalState.jumpList;
             // if the current motion is # or *, use cachedCursor
@@ -1615,6 +1636,7 @@ function initVim$1(CodeMirror) {
             newAnchor = newAnchor || oldAnchor;
             sel.anchor = newAnchor;
             sel.head = newHead;
+            sel.toLineBreak = motion == 'moveToEol' && !vim.visualBlock && !vim.visualLine;  // review-server: v$ takes the line break too
             updateCmSelection(cm);
             updateMark(cm, vim, '<',
                 cursorIsBefore(newAnchor, newHead) ? newAnchor
@@ -1678,6 +1700,9 @@ function initVim$1(CodeMirror) {
               anchor: curStart,
               head: curEnd
             }, mode);
+            if (mode == 'char' && sel.toLineBreak && curEnd.line < cm.lastLine()) {
+              cmSel.ranges[0].head = new Pos(curEnd.line + 1, 0);
+            }
             if (linewise) {
               var ranges = cmSel.ranges;
               if (mode == 'block') {
@@ -1699,6 +1724,23 @@ function initVim$1(CodeMirror) {
               curEnd = tmp;
             }
             linewise = motionArgs.linewise || operatorArgs.linewise;
+            // review-server: :help exclusive. An exclusive motion ending in column 1 stops at the end of the line
+            // above, and becomes linewise if it started at or before the first non-blank.
+            if (!linewise && !motionArgs.inclusive && curEnd.ch === 0 && curStart.line < curEnd.line &&
+                (motion != 'moveByWords' || !motionArgs.forward || operator == 'indent') && motion != 'textObjectManipulation') {
+              if (curStart.ch <= findFirstNonWhiteSpaceCharacter(cm.getLine(curStart.line))) {
+                linewise = true;
+                curEnd.line--;
+              } else {
+                curEnd = new Pos(curEnd.line - 1, lineLength(cm, curEnd.line - 1));
+              }
+            }
+            // review-server: a delete over several lines, from the first non-blank to the end of a line, takes the lines
+            if (!linewise && operator == 'delete' && curStart.line < curEnd.line &&
+                curStart.ch <= findFirstNonWhiteSpaceCharacter(cm.getLine(curStart.line)) &&
+                isWhiteSpaceString((cm.getLine(curEnd.line) || '').slice(curEnd.ch + (motionArgs.inclusive ? 1 : 0)))) {
+              linewise = true;
+            }
             if (linewise) {
               // Expand selection to entire line.
               expandSelectionToLine(cm, curStart, curEnd);
@@ -1920,7 +1962,7 @@ function initVim$1(CodeMirror) {
         var ch = motionArgs.forward ? cur.ch + repeat : cur.ch - repeat;
         return new Pos(cur.line, ch);
       },
-      moveByLines: function(cm, head, motionArgs, vim) {
+      moveByLines: function(cm, head, motionArgs, vim, inputState) {
         var cur = head;
         var endCh = cur.ch;
         // Depending what our last motion was, we may want to do different
@@ -1951,6 +1993,13 @@ function initVim$1(CodeMirror) {
         }
         // Vim go to line begin or line end when cursor at first/last line and
         // move to previous/next line is triggered.
+        // review-server: dj on the last line and dk on the first do nothing
+        if (inputState && inputState.operator && (line < first && cur.line == first || line > last && cur.line == last)) {
+          return null;
+        }
+        if (motionArgs.toFirstChar && (line < first && cur.line == first || line > last && cur.line == last)) {
+          return null;  // review-server: + on the last line goes nowhere
+        }
         if (line < first && cur.line == first){
           return this.moveToStartOfLine(cm, head, motionArgs, vim);
         } else if (line > last && cur.line == last){
@@ -2041,8 +2090,9 @@ function initVim$1(CodeMirror) {
       moveToCharacter: function(cm, head, motionArgs) {
         var repeat = motionArgs.repeat;
         recordLastCharacterSearch(0, motionArgs);
+        // review-server: a failed f must cancel an operator, not act on the cursor's character
         return moveToCharacter(cm, repeat, motionArgs.forward,
-            motionArgs.selectedCharacter) || head;
+            motionArgs.selectedCharacter);
       },
       moveToSymbol: function(cm, head, motionArgs) {
         var repeat = motionArgs.repeat;
@@ -2087,7 +2137,7 @@ function initVim$1(CodeMirror) {
           var matched = cm.findMatchingBracket(new Pos(line, ch), {bracketRegex: re});
           return matched.to;
         } else {
-          return cursor;
+          return null;  // review-server: % with nothing to match fails
         }
       },
       moveToStartOfLine: function(_cm, head) {
@@ -2142,11 +2192,11 @@ function initVim$1(CodeMirror) {
         } else if (selfPaired[character]) {
           tmp = findBeginningAndEnd(cm, head, character, inclusive);
         } else if (character === 'W') {
-          tmp = expandWordUnderCursor(cm, inclusive, true /** forward */,
-                                                     true /** bigWord */);
+          tmp = moreWords(cm, expandWordUnderCursor(cm, inclusive, true /** forward */,
+                                                     true /** bigWord */), motionArgs.repeat, inclusive, true);
         } else if (character === 'w') {
-          tmp = expandWordUnderCursor(cm, inclusive, true /** forward */,
-                                                     false /** bigWord */);
+          tmp = moreWords(cm, expandWordUnderCursor(cm, inclusive, true /** forward */,
+                                                     false /** bigWord */), motionArgs.repeat, inclusive, false);
         } else if (character === 'p') {
           tmp = findParagraph(cm, head, motionArgs.repeat, 0, inclusive);
           motionArgs.linewise = true;
@@ -2160,24 +2210,21 @@ function initVim$1(CodeMirror) {
         } else if (character === 't') {
           tmp = expandTagUnderCursor(cm, head, inclusive);
         } else if (character === 's') {
-          // account for cursor on end of sentence symbol
-          var content = cm.getLine(head.line);
-          if (head.ch > 0 && isEndOfSentenceSymbol(content[head.ch])) {
-            head.ch -= 1;
+          tmp = sentenceObject(cm, head, inclusive);  // review-server: across the lines of a paragraph
+          if (tmp && tmp.wholeLines) {
+            motionArgs.linewise = true;
+            if (vim.visualMode) {
+              if (!vim.visualLine) { vim.visualLine = true; }
+            } else if (vim.inputState.operatorArgs) {
+              vim.inputState.operatorArgs.linewise = true;
+            }
           }
-          var end = getSentence(cm, head, motionArgs.repeat, 1, inclusive);
-          var start = getSentence(cm, head, motionArgs.repeat, -1, inclusive);
-          // closer vim behaviour, 'a' only takes the space after the sentence if there is one before and after
-          if (isWhiteSpaceString(cm.getLine(start.line)[start.ch])
-              && isWhiteSpaceString(cm.getLine(end.line)[end.ch -1])) {
-            start = {line: start.line, ch: start.ch + 1};
-          }
-          tmp = {start: start, end: end};
         } else {
           // No text object defined for this, don't move.
           return null;
         }
 
+        if (!tmp) { return null; }  // review-server: nothing found: fail, rather than throw
         if (!cm.state.vim.visualMode) {
           return [tmp.start, tmp.end];
         } else {
@@ -2187,6 +2234,7 @@ function initVim$1(CodeMirror) {
 
       repeatLastCharacterSearch: function(cm, head, motionArgs) {
         var lastSearch = vimGlobalState.lastCharacterSearch;
+        if (!lastSearch.selectedCharacter) { return null; }  // review-server: ; with nothing to repeat
         var repeat = motionArgs.repeat;
         var forward = motionArgs.forward === lastSearch.forward;
         var increment = (lastSearch.increment ? 1 : 0) * (forward ? -1 : 1);
@@ -2195,7 +2243,7 @@ function initVim$1(CodeMirror) {
         var curEnd = moveToCharacter(cm, repeat, forward, lastSearch.selectedCharacter);
         if (!curEnd) {
           cm.moveH(increment, 'char');
-          return head;
+          return null;  // review-server: as for f
         }
         curEnd.ch += increment;
         return curEnd;
@@ -2236,6 +2284,7 @@ function initVim$1(CodeMirror) {
             }
           }
           var prevLineEnd = new Pos(anchor.line - 1, Number.MAX_VALUE);
+          var keepIndent = args.linewise ? /^\s*/.exec(cm.getLine(anchor.line))[0] : '';
           var wasLastLine = cm.firstLine() == cm.lastLine();
           if (head.line > cm.lastLine() && args.linewise && !wasLastLine) {
             cm.replaceRange('', prevLineEnd, head);
@@ -2245,14 +2294,22 @@ function initVim$1(CodeMirror) {
           if (args.linewise) {
             // Push the next line back down, if there is a next line.
             if (!wasLastLine) {
-              cm.setCursor(prevLineEnd);
-              CodeMirror.commands.newlineAndIndent(cm);
+              // review-server: on the first line, indenting here took the next line's indent away; and cc keeps
+              // the line's own indent
+              if (anchor.line == cm.firstLine()) {
+                cm.replaceRange(keepIndent + '\n', new Pos(anchor.line, 0));
+              } else {
+                cm.setCursor(prevLineEnd);
+                cm.replaceRange('\n' + keepIndent, prevLineEnd);
+              }
+            } else if (keepIndent) {
+              cm.replaceRange(keepIndent, new Pos(anchor.line, 0));
             }
             // make sure cursor ends up at the end of the line.
             anchor.ch = Number.MAX_VALUE;
           }
           finalHead = anchor;
-        } else if (args.fullLine) {
+        } else if (args.fullLine || (args.linewise && !vim.visualBlock)) {  // review-server: Vc keeps the line break
             head.ch = Number.MAX_VALUE;
             head.line--;
             cm.setSelection(anchor, head);
@@ -2277,18 +2334,16 @@ function initVim$1(CodeMirror) {
         if (!vim.visualBlock) {
           var anchor = ranges[0].anchor,
               head = ranges[0].head;
-          if (args.linewise &&
-              head.line != cm.firstLine() &&
-              anchor.line == cm.lastLine() &&
-              anchor.line == head.line - 1) {
-            // Special case for dd on last line (and first line).
+          text = cm.getRange(anchor, head);
+          // review-server: deleting down to the last line (dG, not only dd) leaves no empty line behind
+          if (args.linewise && head.line != cm.firstLine() && head.line > cm.lastLine()) {
+            text = cm.getRange(new Pos(anchor.line, 0), new Pos(cm.lastLine(), lineLength(cm, cm.lastLine()))) + '\n';
             if (anchor.line == cm.firstLine()) {
               anchor.ch = 0;
             } else {
               anchor = new Pos(anchor.line - 1, lineLength(cm, anchor.line - 1));
             }
           }
-          text = cm.getRange(anchor, head);
           cm.replaceRange('', anchor, head);
           finalHead = anchor;
           if (args.linewise) {
@@ -2329,7 +2384,7 @@ function initVim$1(CodeMirror) {
           }
           for (var i = startLine; i <= endLine; i++) {
             for (var j = 0; j < repeat; j++) {
-              cm.indentLine(i, args.indentRight);
+              if (cm.getLine(i)) { cm.indentLine(i, args.indentRight); }  // review-server: blank lines stay blank
             }
           }
         }
@@ -2365,23 +2420,34 @@ function initVim$1(CodeMirror) {
         } else if (!cm.state.vim.visualMode && args.linewise && ranges[0].anchor.line + 1 == ranges[0].head.line) {
           return motions.moveToFirstNonWhiteSpaceCharacter(cm, oldAnchor);
         } else if (args.linewise){
-          return oldAnchor;
+          // review-server: gUk and the like go up to the first line changed
+          return firstLinePos(ranges, oldAnchor, newHead);
         } else {
           return cursorMin(ranges[0].anchor, ranges[0].head);
         }
       },
-      yank: function(cm, args, ranges, oldAnchor) {
+      yank: function(cm, args, ranges, oldAnchor, newHead) {
         var vim = cm.state.vim;
         var text = cm.getSelection();
+        // review-server: after y the cursor goes to the start of what was yanked
         var endPos = vim.visualMode
           ? cursorMin(vim.sel.anchor, vim.sel.head, ranges[0].head, ranges[0].anchor)
-          : oldAnchor;
+          : args.linewise
+            ? firstLinePos(ranges, oldAnchor, newHead)
+            : cursorMin(ranges[0].anchor, ranges[0].head);
         vimGlobalState.registerController.pushText(
             args.registerName, 'yank',
             text, args.linewise, vim.visualBlock);
         return endPos;
       }
     };
+
+    // review-server: where the cursor lands after a linewise y or gU: on the first line, in the column the motion chose
+    function firstLinePos(ranges, oldAnchor, newHead) {
+      var line = Math.min(ranges[0].anchor.line, ranges[0].head.line);
+      var moved = newHead && newHead.line == line && oldAnchor.line != line;
+      return new Pos(line, moved ? newHead.ch : oldAnchor.ch);
+    }
 
     function defineOperator(name, fn) {
       operators[name] = fn;
@@ -2632,6 +2698,8 @@ function initVim$1(CodeMirror) {
             curStart = tmp;
           }
           curEnd.ch = lineLength(cm, curEnd.line) - 1;
+          // review-server: J on one selected line joins it with the next
+          if (curStart.line == curEnd.line && curEnd.line < cm.lastLine()) { curEnd.line++; }
         } else {
           // Repeat is the number of lines to join. Minimum 2 lines.
           var repeat = Math.max(actionArgs.repeat, 2);
@@ -2645,9 +2713,13 @@ function initVim$1(CodeMirror) {
           var tmp = new Pos(curStart.line + 1,
                         lineLength(cm, curStart.line + 1));
           var text = cm.getRange(curStart, tmp);
+          // review-server: no space after a line ending in space, before a blank line, or before )
           text = actionArgs.keepSpaces
             ? text.replace(/\n\r?/g, '')
-            : text.replace(/\n\s*/g, ' ');
+            : text.replace(/\n\s*/, function(_m, at, all) {
+                var rest = all.slice(at + _m.length);
+                return !rest || rest.charAt(0) == ')' || /\s$/.test(all.slice(0, at)) ? '' : ' ';
+              });
           cm.replaceRange(text, curStart, tmp);
         }
         var curFinalPos = new Pos(curStart.line, finalCh);
@@ -2671,6 +2743,13 @@ function initVim$1(CodeMirror) {
           var newlineFn = CodeMirror.commands.newlineAndIndentContinueComment ||
               CodeMirror.commands.newlineAndIndent;
           newlineFn(cm);
+          // review-server: O takes its indent from the line it opens above
+          if (!actionArgs.after) {
+            var opened = cm.getCursor().line;
+            var indent = /^\s*/.exec(cm.getLine(opened + 1) || '')[0];
+            cm.replaceRange(indent, new Pos(opened, 0), new Pos(opened, lineLength(cm, opened)));
+            cm.setCursor(opened, indent.length);
+          }
         }
         this.enterInsertMode(cm, { repeat: actionArgs.repeat }, vim);
       },
@@ -2816,7 +2895,14 @@ function initVim$1(CodeMirror) {
               curPosFinal = cm.posFromIndex(idx + text.length - 1);
             } else {
               idx = cm.indexFromPos(cur);
-              curPosFinal = cm.posFromIndex(idx + text.length);
+              curPosFinal = cm.posFromIndex(idx + text.length - 1);  // review-server: P ends on the last character
+            }
+            // review-server: text with line breaks leaves the cursor at its start; gp and gP go just after it
+            if (!linewise && text.indexOf('\n') != -1) { curPosFinal = copyCursor(cur); }
+            if (actionArgs.cursorAfter) {
+              curPosFinal = linewise
+                ? new Pos(cur.line + text.split('\n').length - 1 + (actionArgs.after ? 1 : 0), 0)
+                : cm.posFromIndex(cm.indexFromPos(cur) + text.length);
             }
           }
         }
@@ -3213,6 +3299,8 @@ function initVim$1(CodeMirror) {
       var sel = cm.state.vim.sel;
       var head = sel.head;
       var anchor = sel.anchor;
+      // review-server: from a selection of one character, a text object replaces it
+      if (cursorEqual(head, anchor)) { head = anchor = cursorMin(start, end); }
       var tmp;
       if (cursorIsBefore(end, start)) {
         tmp = end;
@@ -3368,6 +3456,20 @@ function initVim$1(CodeMirror) {
       return firstNonWS == -1 ? text.length : firstNonWS;
     }
 
+    // review-server: counts on iw, aw, iW, aW: extend by more runs of word, punctuation, or space
+    function moreWords(cm, tmp, repeat, inclusive, bigWord) {
+      if (!tmp || !(repeat > 1)) { return tmp; }
+      var line = cm.getLine(tmp.end.line);
+      var kind = function(c) { return /\s/.test(c) ? 0 : (bigWord || /\w/.test(c)) ? 1 : 2; };
+      var ch = tmp.end.ch;
+      for (var r = 0; r < repeat - 1 && ch < line.length; r++) {
+        var k = kind(line.charAt(ch));
+        while (ch < line.length && kind(line.charAt(ch)) == k) { ch++; }
+        if (inclusive) { while (ch < line.length && kind(line.charAt(ch)) == 0) { ch++; } }
+      }
+      return { start: tmp.start, end: new Pos(tmp.end.line, ch) };
+    }
+
     function expandWordUnderCursor(cm, inclusive, _forward, bigWord, noSymbol) {
       var cur = getHead(cm);
       var line = cm.getLine(cur.line);
@@ -3375,6 +3477,17 @@ function initVim$1(CodeMirror) {
 
       // Seek to first word or non-whitespace character, depending on if
       // noSymbol is true.
+      // review-server: on white space, iw is the white space, and aw that plus the next word
+      if (!noSymbol && /\s/.test(line.charAt(idx))) {
+        var wsStart = idx, wsEnd = idx;
+        while (wsStart > 0 && /\s/.test(line.charAt(wsStart - 1))) { wsStart--; }
+        while (wsEnd < line.length && /\s/.test(line.charAt(wsEnd))) { wsEnd++; }
+        if (inclusive && wsEnd < line.length) {
+          var wordTest = bigWord ? bigWordCharTest[0] : wordCharTest[0](line.charAt(wsEnd)) ? wordCharTest[0] : wordCharTest[1];
+          while (wsEnd < line.length && wordTest(line.charAt(wsEnd))) { wsEnd++; }
+        }
+        return { start: new Pos(cur.line, wsStart), end: new Pos(cur.line, wsEnd) };
+      }
       var test = noSymbol ? wordCharTest[0] : bigWordCharTest [0];
       while (!test(line.charAt(idx))) {
         idx++;
@@ -3435,15 +3548,50 @@ function initVim$1(CodeMirror) {
      *   <div><brok><en></div>
      *   ```
      */
+    // review-server: is and as. Sentences end in . ! or ? before white space, and a blank line ends a paragraph.
+    function sentenceObject(cm, head, inclusive) {
+      if (!cm.getLine(head.line)) { return null; }
+      var first = head.line, last = head.line;
+      while (first > cm.firstLine() && cm.getLine(first - 1)) { first--; }
+      while (last < cm.lastLine() && cm.getLine(last + 1)) { last++; }
+      var base = new Pos(first, 0), text = cm.getRange(base, new Pos(last, cm.getLine(last).length));
+      var offset = cm.indexFromPos(head) - cm.indexFromPos(base);
+      var pos = function(i) { return cm.posFromIndex(cm.indexFromPos(base) + i); };
+      var lead = /^\s*/.exec(text)[0].length, re = /[.!?]+[)\]"']*(?=\s|$)/g, starts = [lead], ends = [], m;
+      while ((m = re.exec(text))) {
+        var after = m.index + m[0].length, next = after;
+        ends.push(after);
+        while (next < text.length && /\s/.test(text.charAt(next))) { next++; }
+        if (next < text.length) { starts.push(next); }
+      }
+      if (ends.length < starts.length) { ends.push(text.length); }
+      for (var i = 0; i < starts.length; i++) {
+        var wsEnd = i + 1 < starts.length ? starts[i + 1] : text.length;
+        if (offset >= wsEnd && i + 1 < starts.length) { continue; }
+        if (offset >= ends[i] && offset < wsEnd) {      // in the space between two sentences
+          return inclusive ? { start: pos(ends[i]), end: pos(i + 1 < ends.length ? ends[i + 1] : wsEnd) } : { start: pos(ends[i]), end: pos(wsEnd) };
+        }
+        var startsLine = !text.slice(0, starts[i]).split('\n').pop().trim(), reachesEnd = i == starts.length - 1;
+        if (startsLine && reachesEnd && ends[i] == text.length) {
+          return { start: pos(starts[i]), end: pos(ends[i]), wholeLines: true };
+        }
+        if (!inclusive) { return { start: pos(starts[i]), end: pos(ends[i]) }; }
+        if (wsEnd > ends[i]) { return { start: pos(starts[i]), end: pos(wsEnd) }; }
+        var sameLine = i && text.slice(ends[i - 1], starts[i]).indexOf('\n') == -1;
+        return { start: pos(sameLine ? ends[i - 1] : starts[i]), end: pos(ends[i]) };
+      }
+      return null;
+    }
+
     function expandTagUnderCursor(cm, head, inclusive) {
       var cur = head;
       if (!CodeMirror.findMatchingTag || !CodeMirror.findEnclosingTag) {
-        return { start: cur, end: cur };
+        return null;  // review-server: fail, as for brackets
       }
 
       var tags = CodeMirror.findMatchingTag(cm, head) || CodeMirror.findEnclosingTag(cm, head);
       if (!tags || !tags.open || !tags.close) {
-        return { start: cur, end: cur };
+        return null;
       }
 
       if (inclusive) {
@@ -3737,6 +3885,7 @@ function initVim$1(CodeMirror) {
       var idx;
       for (var i = 0; i < repeat; i ++) {
         var line = cm.getLine(cur.line);
+        if (!forward && start <= 0) { return null; }  // review-server: F and T at the start of a line found the cursor's own character
         idx = charIdxInLine(start, line, character, forward, true);
         if (idx == -1) {
           return null;
@@ -3799,6 +3948,8 @@ function initVim$1(CodeMirror) {
           if (isBoundary(i, dir)) { repeat--; }
           i += dir;
         }
+        // review-server: } with no more paragraphs goes to the end of the last line
+        if (i > max) { return new Pos(max, cm.getLine(max).length); }
         return new Pos(i, 0);
       }
 
@@ -4142,7 +4293,7 @@ function initVim$1(CodeMirror) {
 
     // TODO: perhaps this finagling of start and end positions belongs
     // in codemirror/replaceRange?
-    function selectCompanionObject(cm, head, symb, inclusive) {
+    function selectCompanionObject(cm, head, symb, inclusive, lookedAhead) {
       var cur = head, start, end;
 
       var bracketRegexp = ({
@@ -4164,7 +4315,13 @@ function initVim$1(CodeMirror) {
       end = cm.scanForBracket(new Pos(cur.line, cur.ch + offset), 1, undefined, {'bracketRegex': bracketRegexp});
 
       if (!start || !end) {
-        return { start: cur, end: cur };
+        // review-server: not inside a pair: use the next one, as Vim 9.1 does, or fail
+        if (lookedAhead) { return null; }
+        for (var scan = cur.line, from = cur.ch + 1; scan <= cm.lastLine(); scan++, from = 0) {
+          var at = cm.getLine(scan).indexOf(openSym, from);
+          if (at != -1) { return selectCompanionObject(cm, new Pos(scan, at), symb, inclusive, true); }
+        }
+        return null;
       }
 
       start = start.pos;
@@ -4233,12 +4390,20 @@ function initVim$1(CodeMirror) {
 
       // nothing found
       if (!start || !end) {
-        return { start: cur, end: cur };
+        return null;  // review-server: as for brackets
       }
 
       // include the symbols
       if (inclusive) {
         --start; ++end;
+        // review-server: a" also takes the white space after it, or else before it
+        var afterEnd = end;
+        while (afterEnd < chars.length && /\s/.test(chars[afterEnd])) { afterEnd++; }
+        if (afterEnd > end) {
+          end = afterEnd;
+        } else {
+          while (start > 0 && /\s/.test(chars[start - 1])) { start--; }
+        }
       }
 
       return {
@@ -4248,7 +4413,7 @@ function initVim$1(CodeMirror) {
     }
 
     // Search functions
-    defineOption('pcre', true, 'boolean');
+    defineOption('pcre', false, 'boolean');  // review-server: Vim's own patterns, not JavaScript's
     function SearchState() {}
     SearchState.prototype = {
       getQuery: function() {
@@ -4318,55 +4483,117 @@ function initVim$1(CodeMirror) {
     }
 
     // Translates a search string from ex (vim) syntax into javascript form.
+    // review-server: Vim's patterns to JavaScript's, in place of the original, which knew only a few of them.
+    // Handles \v \m \V \c \C \< \> \+ \? \= \| \( \) \%( \{n,m} \{-} \a \l \u \h \x and the like.
+    var vimClasses = {a: '[A-Za-z]', A: '[^A-Za-z]', l: '[a-z]', L: '[^a-z]', u: '[A-Z]', U: '[^A-Z]',
+      h: '[A-Za-z_]', H: '[^A-Za-z_]', x: '[0-9A-Fa-f]', X: '[^0-9A-Fa-f]', o: '[0-7]', O: '[^0-7]',
+      s: '[ \\t]', S: '[^ \\t]', e: '\\x1b', i: '[A-Za-z_]', I: '[^A-Za-z_]', k: '\\w', K: '[^\\w]', f: '\\S', F: '\\S', p: '\\S', P: '\\S'};
     function translateRegex(str) {
-      // When these match, add a '\' if unescaped or remove one if escaped.
-      var specials = '|(){';
-      // Remove, but never add, a '\' for these.
-      var unescape = '}';
-      var escapeNextChar = false;
-      var out = [];
-      for (var i = -1; i < str.length; i++) {
-        var c = str.charAt(i) || '';
-        var n = str.charAt(i+1) || '';
-        var specialComesNext = (n && specials.indexOf(n) != -1);
-        if (escapeNextChar) {
-          if (c !== '\\' || !specialComesNext) {
-            out.push(c);
+      var out = [], veryMagic = false, noMagic = false, i = 0, ignore = null;
+      var braces = function(body) {
+        var m = /^(-?)(\d*)(,?)(\d*)$/.exec(body);
+        if (!m) { return null; }
+        var count = (m[2] || (m[3] ? '0' : '')) + m[3] + m[4];
+        var q = count === '' ? '*' : '{' + count + '}';
+        return q + (m[1] ? '?' : '');
+      };
+      while (i < str.length) {
+        var c = str.charAt(i), n = str.charAt(i + 1);
+        if (c == '\\') {
+          i += 2;
+          if (n == 'v') { veryMagic = true; noMagic = false; continue; }
+          if (n == 'V') { veryMagic = false; noMagic = true; continue; }
+          if (n == 'm' || n == 'M') { veryMagic = false; noMagic = n == 'M'; continue; }
+          if (n == 'c') { ignore = true; continue; }
+          if (n == 'C') { ignore = false; continue; }
+          if (n == '<') { out.push(veryMagic ? '<' : '\\b(?=\\w)'); continue; }
+          if (n == '>') { out.push(veryMagic ? '>' : '\\b(?<=\\w)'); continue; }
+          if (n == '%' && str.charAt(i) == '(' && !veryMagic) { out.push('(?:'); i++; continue; }
+          if (n == '{' && !veryMagic) {
+            var end = str.indexOf('}', i), q = end == -1 ? null : braces(str.slice(i, end).replace(/\\$/, ''));
+            if (q) { out.push(q); i = end + 1; continue; }
+            out.push('\\{'); continue;
           }
-          escapeNextChar = false;
-        } else {
-          if (c === '\\') {
-            escapeNextChar = true;
-            // Treat the unescape list as special for removing, but not adding '\'.
-            if (n && unescape.indexOf(n) != -1) {
-              specialComesNext = true;
-            }
-            // Not passing this test means removing a '\'.
-            if (!specialComesNext || n === '\\') {
-              out.push(c);
-            }
-          } else {
-            out.push(c);
-            if (specialComesNext && n !== '\\') {
-              out.push('\\');
-            }
+          if ('()|+?='.indexOf(n) != -1) {
+            if (veryMagic) { out.push('\\' + n); } else { out.push(n == '=' ? '?' : n); }
+            continue;
           }
+          if (vimClasses[n]) { out.push(vimClasses[n]); continue; }
+          if (noMagic && '.*[~'.indexOf(n) != -1) { out.push(n == '~' ? '~' : (n == '[' ? '[' : n)); continue; }
+          if (n == '/' || n == '&' || n == '~' || n == '%' || n == '@') { out.push(n == '/' || n == '~' || n == '&' || n == '%' || n == '@' ? n : '\\' + n); continue; }
+          if (n === '') { out.push('\\\\'); continue; }
+          out.push('\\' + n);
+          continue;
         }
+        i++;
+        if (noMagic && (c == '.' || c == '*' || c == '[' || c == '~')) { out.push('\\' + c); continue; }
+        if (c == '[') {
+          var close = str.indexOf(']', i + (str.charAt(i) == '^' ? 2 : 1));
+          if (close == -1) { out.push('\\['); continue; }
+          out.push(str.slice(i - 1, close + 1).replace(/\[:alpha:\]/g, 'A-Za-z').replace(/\[:digit:\]/g, '0-9')
+            .replace(/\[:space:\]/g, '\\s').replace(/\[:upper:\]/g, 'A-Z').replace(/\[:lower:\]/g, 'a-z'));
+          i = close + 1;
+          continue;
+        }
+        if (veryMagic) {
+          if (c == '<') { out.push('\\b(?=\\w)'); continue; }
+          if (c == '>') { out.push('\\b(?<=\\w)'); continue; }
+          if (c == '=') { out.push('?'); continue; }
+          if (c == '%' && n == '(') { out.push('(?:'); i++; continue; }
+          if (c == '{') {
+            var vend = str.indexOf('}', i), vq = vend == -1 ? null : braces(str.slice(i, vend));
+            if (vq) { out.push(vq); i = vend + 1; continue; }
+            out.push('\\{'); continue;
+          }
+          out.push(c == '}' ? '\\}' : c);
+          continue;
+        }
+        if ('()|+?{}'.indexOf(c) != -1) { out.push('\\' + c); continue; }
+        if (c == '*' && out.length === 0) { out.push('\\*'); continue; }
+        if (c == '^' && out.length !== 0 && out[out.length - 1] != '(' && out[out.length - 1] != '|') { out.push('\\^'); continue; }
+        if (c == '$' && i < str.length && n !== '' && str.slice(i, i + 2) != '\\|' && str.slice(i, i + 2) != '\\)') { out.push('\\$'); continue; }
+        out.push(c);
       }
+      translateRegex.ignoreCase = ignore;
       return out.join('');
     }
 
     // Translates the replace part of a search and replace from ex (vim) syntax into
     // javascript form.  Similar to translateRegex, but additionally fixes back references
     // (translates '\[0..9]' to '$[0..9]') and follows different rules for escaping '$'.
-    var charUnescapes = {'\\n': '\n', '\\r': '\r', '\\t': '\t'};
+    var charUnescapes = {'\\n': '\n', '\\r': '\n', '\\t': '\t'};
+    var caseMarks = {'\\U': '\uE001', '\\L': '\uE002', '\\E': '\uE003', '\\e': '\uE003', '\\u': '\uE004', '\\l': '\uE005'};
+    function applyCaseMarks(text) {
+      if (!/[\uE001-\uE005]/.test(text)) { return text; }
+      var out = '', mode = null, once = null;
+      for (var i = 0; i < text.length; i++) {
+        var c = text.charAt(i);
+        if (c == '\uE001') { mode = 'U'; continue; }
+        if (c == '\uE002') { mode = 'L'; continue; }
+        if (c == '\uE003') { mode = null; continue; }
+        if (c == '\uE004') { once = 'U'; continue; }
+        if (c == '\uE005') { once = 'L'; continue; }
+        var how = once || mode;
+        once = null;
+        out += how == 'U' ? c.toUpperCase() : how == 'L' ? c.toLowerCase() : c;
+      }
+      return out;
+    }
     function translateRegexReplace(str) {
       var escapeNextChar = false;
       var out = [];
       for (var i = -1; i < str.length; i++) {
         var c = str.charAt(i) || '';
         var n = str.charAt(i+1) || '';
-        if (charUnescapes[c + n]) {
+        if (!escapeNextChar && caseMarks[c + n]) {  // review-server: \U \L \E \u \l, applied after replacing
+          out.push(caseMarks[c + n]);
+          i++;
+        } else if (!escapeNextChar && c == '&') {  // review-server: & is the whole match, and \& a plain &
+          out.push('$&');
+        } else if (!escapeNextChar && c == '\\' && n == '&') {
+          out.push('&');
+          i++;
+        } else if (charUnescapes[c + n]) {
           out.push(charUnescapes[c+n]);
           i++;
         } else if (escapeNextChar) {
@@ -4456,8 +4683,15 @@ function initVim$1(CodeMirror) {
       if (!regexPart) {
         return null;
       }
+      // review-server: searches follow 'ignorecase' and 'smartcase', off by default as in Vim
+      ignoreCase = !!getOption('ignorecase');
+      smartCase = ignoreCase && !!getOption('smartcase');
       if (!getOption('pcre')) {
         regexPart = translateRegex(regexPart);
+        if (translateRegex.ignoreCase !== null) {
+          smartCase = false;
+          ignoreCase = translateRegex.ignoreCase;
+        }
       }
       if (smartCase) {
         ignoreCase = (/^[^A-Z]*$/).test(regexPart);
@@ -4832,7 +5066,7 @@ function initVim$1(CodeMirror) {
         }
 
         // Parse command name.
-        var commandMatch = inputStream.match(/^(\w+|!!|@@|[!#&*<=>@~])/);
+        var commandMatch = inputStream.match(/^([a-zA-Z_]+|!!|@@|[!#&*<=>@~])/);  // review-server: so that :1m3 is :m with 3
         if (commandMatch) {
           result.commandName = commandMatch[1];
         } else {
@@ -5209,6 +5443,10 @@ function initVim$1(CodeMirror) {
           return;
         }
         var inverted = params.commandName[0] === 'v';
+        if (argString && argString.charAt(0) == '!') {  // review-server: :g! is :v
+          inverted = true;
+          argString = argString.substring(1);
+        }
         // range is specified here
         var lineStart = (params.line !== undefined) ? params.line : cm.firstLine();
         var lineEnd = params.lineEnd || params.line || cm.lastLine();
@@ -5461,7 +5699,7 @@ function initVim$1(CodeMirror) {
       }
       function replace() {
         var text = cm.getRange(searchCursor.from(), searchCursor.to());
-        var newText = text.replace(query, replaceWith);
+        var newText = applyCaseMarks(text.replace(query, replaceWith));
         var unmodifiedLineNumber = searchCursor.to().line;
         searchCursor.replace(newText);
         modifiedLineNumber = searchCursor.to().line;
@@ -5496,10 +5734,12 @@ function initVim$1(CodeMirror) {
         if (close) { close(); }
         cm.focus();
         if (lastPos) {
-          cm.setCursor(lastPos);
+          // review-server: :s leaves the cursor at the start of the last line it changed
+          var endLine = Math.min(lastPos.line, cm.lastLine());
+          cm.setCursor(endLine, findFirstNonWhiteSpaceCharacter(cm.getLine(endLine)));
           var vim = cm.state.vim;
           vim.exMode = false;
-          vim.lastHPos = vim.lastHSPos = lastPos.ch;
+          vim.lastHPos = vim.lastHSPos = cm.getCursor().ch;
         }
         if (callback) { callback(); }
       }
