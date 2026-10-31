@@ -266,16 +266,19 @@ def image_refs(name, text):
     ext = Path(str(name)).suffix.lower()
     if ext == '.tex':
         refs = TEX_IMAGE.findall(no_tex_comments(text))
-    elif ext in ('.md', '.markdown'):
-        refs = [a or b for a, b in MD_IMAGE.findall(text)]
+    elif ext in ('.md', '.markdown'):                # Markdown can hold raw LaTeX figures too
+        found = [(m.start(), m.group(1) or m.group(2)) for m in MD_IMAGE.finditer(text)]
+        found += [(m.start(), m.group(1)) for m in TEX_IMAGE.finditer(text)]
+        refs = [r for _, r in sorted(found)]
     else:
         refs = []
     return [r for r in dict.fromkeys(x.strip() for x in refs) if not re.match(r'^(data:|https?://)', r, re.I)]
 
 
 def find_images(path, text):
-    """[(reference, file or None)] for a text file on disk. Only files in its folder or git repository count,
-    so a reference cannot pull in anything else from the machine."""
+    """[(reference, file or None)] for a text file on disk. A reference is looked for where it says, then as the
+    one file with its name under a figures, figs, or images folder beside the text file or one folder up. Only
+    files in its folder or git repository count, so a reference cannot pull in anything else from the machine."""
     path = Path(path).expanduser().resolve()
     limit = git_root(path) or path.parent
     dirs = [path.parent]
@@ -285,7 +288,14 @@ def find_images(path, text):
     out = []
     for ref in image_refs(path, text):
         name = urllib.parse.unquote(ref)
-        tries = [d / (name + ext) for d in dirs for ext in ['', '.pdf', '.png', '.jpg', '.jpeg', '.svg']]
+        exts = ['', '.pdf', '.png', '.jpg', '.jpeg', '.svg']
+        tries = [d / (name + ext) for d in dirs for ext in exts]
+        for ext in exts:
+            names = (Path(name).name + ext)
+            same = [Path(w) / names for top in (path.parent, path.parent.parent) for sub in ('figures', 'figs', 'images')
+                    for w, _, files in os.walk(str(top / sub)) if names in files]
+            if len(same) == 1:                           # two files with that name: leave it for the reviewer to choose
+                tries.append(same[0])
         hit = None
         for t in tries:
             try:

@@ -408,6 +408,25 @@ class TextFiles(Base):
         doc.write_text(text)
         return doc
 
+    def test_markdown_with_raw_latex_figures(self):
+        refs = review.image_refs('a.md', '![one](a.png)\n```{=latex}\n\\includegraphics[width=6.5in]{b.pdf}\n```\n50% ![three](c.jpg)\n')
+        self.assertEqual(refs, ['a.png', 'b.pdf', 'c.jpg'])
+        app = self.tmp / 'repo' / 'app'
+        (app / 'drafts').mkdir(parents=True)
+        (self.tmp / 'repo' / '.git').mkdir(exist_ok=True)
+        (app / 'figures' / 'set_v1').mkdir(parents=True)
+        (app / 'figures' / 'set_v2').mkdir()
+        (app / 'figures' / 'set_v1' / 'one.pdf').write_bytes(PDF)
+        (app / 'figures' / 'set_v1' / 'two.png').write_bytes(b'a')
+        (app / 'figures' / 'set_v2' / 'two.png').write_bytes(b'b')
+        text = '\\includegraphics{one.pdf}\n\\includegraphics{two.png}\n\\includegraphics{three.png}\n'
+        doc = app / 'drafts' / 'plan_v1.md'
+        doc.write_text(text)
+        found = dict(review.find_images(doc, text))
+        self.assertEqual(found['one.pdf'], app / 'figures' / 'set_v1' / 'one.pdf')
+        self.assertIsNone(found['two.png'])          # two files with that name
+        self.assertIsNone(found['three.png'])
+
     def test_queue_brings_images(self):
         doc = self.write_doc('\\graphicspath{{fig/}}\n\\includegraphics{one}\n\\includegraphics{two.pdf}\n'
                              '\\includegraphics{../shared.png}\n\\includegraphics{../../outside.png}\n\\includegraphics{gone}\n')
