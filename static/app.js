@@ -364,24 +364,26 @@
     T.cm.focus();
   });
 
-  // Holding a movement key. Macs and iPads often send no repeats for letter keys in a text field, so the page
-  // repeats the key itself, and steps aside if the browser does send them. Only keys that move: if a key release
-  // were ever lost, these would just stop at the end of the file, where a repeating x would keep deleting.
+  // Holding a movement key. Browsers are unreliable here: on a Mac, Chrome can send one repeat and then none. So the
+  // page does all the repeating itself, ignores the browser's repeats, and stops only when the key is let go. Only
+  // keys that move: if a key release were ever lost, these would just stop at the end of the file, where a repeating
+  // x would keep deleting.
   const HOLD_KEYS = 'hjklwbeWBE{}';
-  const HOLD_WAIT = 280, HOLD_EVERY = 30, HOLD_MOST = 20000;
+  const HOLD_WAIT = 280, HOLD_EVERY = 30;
   let holdTimer = null, holdKey = null;
   function stopHold() { clearTimeout(holdTimer); clearInterval(holdTimer); holdTimer = null; holdKey = null; }
   document.addEventListener('keydown', e => {
+    if (e.repeat && e.key === holdKey) { e.preventDefault(); e.stopPropagation(); return; }
     stopHold();
-    if (e.repeat || !T.cm || !$('#vimOn').checked || e.ctrlKey || e.metaKey || e.altKey || !HOLD_KEYS.includes(e.key)) return;
+    if (!T.cm || !$('#vimOn').checked || e.ctrlKey || e.metaKey || e.altKey || !HOLD_KEYS.includes(e.key)) return;
     if (!T.cm.getWrapperElement().contains(e.target) || e.target.closest('.CodeMirror-dialog')) return;
     const cm = T.cm, vim = cm.state.vim;       // this runs before the editor sees the key
     if (!vim || vim.insertMode || vim.inputState.operator || vim.inputState.keyBuffer.length) return;
-    const key = e.key, started = Date.now();
+    const key = e.key;
     holdKey = key;
     holdTimer = setTimeout(() => {
       holdTimer = setInterval(() => {
-        if (T.cm !== cm || vim.insertMode || Date.now() - started > HOLD_MOST) { stopHold(); return; }
+        if (T.cm !== cm || vim.insertMode) { stopHold(); return; }
         CodeMirror.Vim.handleKey(cm, key, 'user');
       }, HOLD_EVERY);
     }, HOLD_WAIT);
