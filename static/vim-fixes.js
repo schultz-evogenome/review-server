@@ -169,6 +169,7 @@ window.reviewVim = (function () {
   };
   const visibleBottom = cm => window.innerHeight - 2 * lineHeight(cm);
   function keepCursorInView(cm) {
+    if (cm.getOption('readOnly') === 'nocursor') return;    // a pen is chosen: the cursor is not in use, so it stays put
     const r = cm.cursorCoords(null, 'window'), top = visibleTop(cm), bottom = visibleBottom(cm);
     // On the first row, show the top of the page, with any note above the text.
     if (Math.abs(rowTop(cm, cm.getCursor()) - rowTop(cm, new Pos(cm.firstLine(), 0))) < 2) window.scrollTo(0, 0);

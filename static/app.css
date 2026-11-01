@@ -90,8 +90,8 @@ button.discuss { background: var(--discuss-solid); border-color: var(--discuss-s
 .seg button:first-child { border-radius: 10px 0 0 10px; margin-left: 0; }
 .seg button:last-child { border-radius: 0 10px 10px 0; }
 .seg button.on { background: var(--fg); color: var(--bg); border-color: var(--fg); position: relative; }
-.seg button[data-tool="change"].on, .seg button[data-settag="change"].on { background: var(--change-solid); border-color: var(--change-solid); color: #1d1d1f; }
-.seg button[data-tool="discuss"].on, .seg button[data-settag="discuss"].on { background: var(--discuss-solid); border-color: var(--discuss-solid); color: #fff; }
+.seg button[data-tool="change"].on, .seg button[data-ttool="change"].on, .seg button[data-settag="change"].on { background: var(--change-solid); border-color: var(--change-solid); color: #1d1d1f; }
+.seg button[data-tool="discuss"].on, .seg button[data-ttool="discuss"].on, .seg button[data-settag="discuss"].on { background: var(--discuss-solid); border-color: var(--discuss-solid); color: #fff; }
 
 .check { display: inline-flex; align-items: center; gap: 6px; font-size: 15px; color: var(--muted); -webkit-user-select: none; user-select: none; }
 .check input { width: 20px; height: 20px; }
@@ -239,7 +239,11 @@ body.writing #bar { border-bottom-color: transparent; }
 body.writing.typing #bar { transform: translateY(-100%); }
 body.writing #brief { max-width: 780px; margin: 12px max(16px, calc((100% - 780px) / 2)) 0; opacity: 0.85; }
 #wordCount { font-size: 14px; }
-#editor { padding: 0 16px; min-height: calc(100vh - 120px); cursor: text; }
+#editor { position: relative; padding: 0 16px; min-height: calc(100vh - 120px); cursor: text; }
+#editor.drawing, #editor.drawing .CodeMirror, #editor.drawing .CodeMirror-lines { cursor: crosshair; }
+#editor.drawing .CodeMirror { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+#hlBadges { position: absolute; top: 0; left: 0; width: 0; height: 0; z-index: 5; }
+#hlBadges .badge { cursor: pointer; }
 #editor .CodeMirror {
   height: auto;
   max-width: 72ch;
@@ -257,6 +261,10 @@ body.writing #brief { max-width: 780px; margin: 12px max(16px, calc((100% - 780p
 #editor .CodeMirror-matchingbracket { color: inherit; background: var(--selected); }
 .cm-s-goyo span.cm-changed { background: var(--edited); border-radius: 2px; }
 .cm-s-goyo .cm-gone { display: inline-block; width: 2px; height: 1em; margin: 0 1px; vertical-align: -0.12em; background: var(--danger); opacity: 0.7; }
+.cm-s-goyo span.cm-hl-change { background: var(--change); border-radius: 2px; }
+.cm-s-goyo span.cm-hl-discuss { background: var(--discuss); border-radius: 2px; }
+.cm-s-goyo span.cm-hl-open { box-shadow: 0 0 0 2px var(--fg); }
+.cm-s-goyo span.cm-hl-trial { outline: 1px dashed var(--muted); }
 .cm-s-goyo span.cm-header { font-weight: 700; color: var(--fg); }
 .cm-s-goyo span.cm-strong { font-weight: 700; }
 .cm-s-goyo span.cm-em { font-style: italic; }
@@ -304,6 +312,9 @@ body.previewing #brief { margin-right: calc(50% + 16px); margin-left: 16px; }
 #preview th, #preview td { border: 1px solid var(--line); padding: 3px 8px; }
 #preview .pv-caption { font-size: 14px; color: var(--muted); }
 #preview mark.pv-new { background: var(--edited); color: inherit; border-radius: 2px; }
+#preview mark.pv-hl { color: inherit; border-radius: 2px; }
+#preview mark.pv-hl.change { background: var(--change); }
+#preview mark.pv-hl.discuss { background: var(--discuss); }
 #preview .pv-gone { display: inline-block; width: 2px; height: 1em; margin: 0 1px; vertical-align: -0.12em; background: var(--danger); opacity: 0.7; }
 @media (max-width: 900px) {
   #preview { width: 100%; z-index: 15; padding-left: 16px; padding-right: 16px; }

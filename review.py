@@ -414,13 +414,23 @@ def clean_highlights(raw):
             if SAFE_FILE.match(f):
                 audio.append({'file': f, 'mime': str(c.get('mime', ''))[:40],
                               'seconds': round(float(c.get('seconds') or 0), 1), 'created_at': str(c.get('created_at', ''))[:40]})
-        out.append({
+        clean = {
             'n': int(h.get('n', 0)), 'id': str(h.get('id', ''))[:40], 'tag': h['tag'],
             'page': int(h.get('page') or (rects[0]['page'] if rects else 0)),
             'text': str(h.get('text', ''))[:20000], 'note': str(h.get('note', ''))[:20000], 'rects': rects,
             'audio': audio,
             'created_at': str(h.get('created_at', ''))[:40], 'updated_at': str(h.get('updated_at', ''))[:40],
-        })
+        }
+        # In a text file: where the words are in the current text. Missing once they have all been deleted.
+        a = h.get('anchor')
+        if isinstance(a, dict):
+            try:
+                anchor = {k: int(a[k]) for k in ('line', 'ch', 'end_line', 'end_ch')}
+            except (KeyError, TypeError, ValueError):
+                anchor = None
+            if anchor and min(anchor.values()) >= 0:
+                clean['anchor'] = anchor
+        out.append(clean)
     return out
 
 
@@ -443,7 +453,7 @@ def clock(seconds):
 
 
 def format_review(s, highlights, path=None, texts=None, text=None):
-    """One item as Markdown: its numbered highlights, with notes and transcribed voice notes, or for a
+    """One item as Markdown: its numbered highlights, with notes and transcribed voice notes, and for a
     text file the diff of the reviewer's edits."""
     one = lambda t: ' '.join(str(t).split())
     texts = texts or {}
@@ -465,16 +475,22 @@ def format_review(s, highlights, path=None, texts=None, text=None):
     else:
         out.append('- Not marked done yet.')
     if text is not None:
-        if not text['edited']:
+        if text['edited']:
+            out.append('- Edited %s; the full text is at edited/%s in the item folder.' % (text['updated_at'], text['name']))
+        else:
             out.append('- No edits.')
-            return '\n'.join(out)
-        out.append('- Edited %s; the full text is at edited/%s in the item folder.' % (text['updated_at'], text['name']))
-        return '\n'.join(out + ['', '```diff', text['diff'], '```'])
-    out.append('- %d highlights: %d change, %d discuss. Numbers follow the order they were made.'
-               % (s['count'], s['change'], s['discuss']))
-    out.append('')
+    if text is None or hl:
+        out.append('- %d highlights: %d change, %d discuss. Numbers follow the order they were made.'
+                   % (s['count'], s['change'], s['discuss']))
+        if text is not None:
+            out.append('- Line numbers count from 1 in %s.' % ('edited/' + text['name'] if text['edited'] else text['name']))
+        out.append('')
     for h in hl:
-        out.append('%d. **%s**, page %s: "%s"' % (h.get('n', 0), h.get('tag'), h.get('page', '?'), one(h.get('text', ''))))
+        if text is None:
+            where = 'page %s' % h.get('page', '?')
+        else:
+            where = 'line %d' % (h['anchor']['line'] + 1) if h.get('anchor') else 'words since deleted'
+        out.append('%d. **%s**, %s: "%s"' % (h.get('n', 0), h.get('tag'), where, one(h.get('text', ''))))
         if h.get('note'):
             out.append('   Note: %s' % one(h['note']))
         for k, c in enumerate(h.get('audio') or [], 1):
@@ -487,6 +503,8 @@ def format_review(s, highlights, path=None, texts=None, text=None):
         for f in extra:
             n = number.get(f.split('_')[0])
             out.append('- %s%s: %s' % (f, ', for highlight %d' % n if n else '', said(texts[f])))
+    if text is not None and text['edited']:
+        out += ['', '```diff', text['diff'], '```']
     return '\n'.join(out)
 
 
@@ -510,9 +528,9 @@ def status_label(s):
 
 
 def marks_label(s):
-    """"  3 highlights", or for a text file whether it has been edited."""
+    """"  3 highlights", or for a text file whether it has been edited, and any highlights."""
     if s.get('kind') == 'text':
-        return 'text, edited' if s.get('edited') else 'text, no edits'
+        return ('text, edited' if s.get('edited') else 'text, no edits') + (', %d highlights' % s['count'] if s.get('count') else '')
     return '%3d highlights' % s['count']
 
 

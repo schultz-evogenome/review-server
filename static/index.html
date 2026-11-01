@@ -35,11 +35,17 @@
     <button id="listBtn">List</button>
   </div>
   <div class="row tools" id="textTools" hidden>
+    <span class="seg" role="group" aria-label="Tool">
+      <button data-ttool="edit" class="on">Edit</button>
+      <button data-ttool="change">Change pen</button>
+      <button data-ttool="discuss">Discuss pen</button>
+    </span>
     <label class="check"><input type="checkbox" id="vimOn"> Vim keys</label>
     <span id="wordCount" class="muted"></span>
     <span class="spacer"></span>
     <button id="previewBtn" hidden title="Show the Markdown rendered, beside the text">Preview</button>
     <button id="imagesBtn" hidden>Images</button>
+    <button id="textListBtn">List</button>
     <button id="revertBtn" title="Go back to the file as queued">Revert</button>
   </div>
 </header>

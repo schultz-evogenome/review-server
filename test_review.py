@@ -382,6 +382,48 @@ class TextFiles(Base):
             review.main(['show', str(p), '--json', '--root', str(self.tmp / 'repo')])
         self.assertEqual(json.loads(out.getvalue())['text']['current'], 'one\ntwo and more\n')
 
+    def test_highlights_on_a_text_file(self):
+        iid, p = self.queue_text('Plan_v1.md', title='The plan')
+        where = {'line': 1, 'ch': 0, 'end_line': 1, 'end_ch': 3}
+        marks = [{'n': 1, 'id': 'a1', 'tag': 'change', 'page': 2, 'text': 'two', 'rects': [], 'anchor': where},
+                 {'n': 2, 'id': 'a2', 'tag': 'discuss', 'page': 5, 'text': 'since deleted', 'rects': [], 'anchor': None},
+                 {'n': 3, 'id': 'a3', 'tag': 'change', 'page': 1, 'text': 'bad', 'rects': [], 'anchor': {'line': 'x'}},
+                 {'n': 4, 'id': 'a4', 'tag': 'change', 'page': 1, 'text': 'worse', 'rects': [],
+                  'anchor': {'line': -1, 'ch': 0, 'end_line': 0, 'end_ch': 1}}]
+        code, r = self.call('PUT', '/api/items/%s/highlights' % iid, {'base_version': 0, 'max_n': 4, 'highlights': marks})
+        self.assertEqual((code, r['item']['count'], r['item']['edited']), (200, 4, False))
+        kept = {h['id']: h.get('anchor') for h in r['highlights']['highlights']}
+        self.assertEqual(kept, {'a1': where, 'a2': None, 'a3': None, 'a4': None})
+        self.save(iid, 'one\ntwo and more\n')
+
+        def shown():
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                review.main(['show', str(p), '--root', str(self.tmp / 'repo')])
+            return out.getvalue()
+        text = shown()
+        self.assertIn('1. **change**, line 2: "two"', text)
+        self.assertIn('2. **discuss**, words since deleted: "since deleted"', text)
+        self.assertIn('Line numbers count from 1 in edited/Plan_v1.md', text)
+        self.assertLess(text.index('1. **change**'), text.index('+two and more'))     # the highlights, then the diff
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            review.main(['list', '--all', '--root', str(self.tmp / 'repo')])
+        self.assertIn('text, edited, 4 highlights', out.getvalue())
+        v2, _ = self.queue_text('Plan_v2.md')
+        self.assertEqual(self.store.sweep(), [])                                      # marked up, so it stays open
+
+    def test_text_file_with_nothing_marked_says_only_that(self):
+        _, p = self.queue_text('Plan_v1.md', title='The plan')
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            review.main(['show', str(p), '--root', str(self.tmp / 'repo')])
+        self.assertIn('- No edits.', out.getvalue())
+        self.assertNotIn('highlights:', out.getvalue())
+
+    def test_a_pdf_highlight_keeps_its_page(self):
+        text = review.format_review({'title': 't', 'file': 'a.pdf', 'pdf': 'a.pdf', 'sha256': 'abc', 'source': 's', 'doc': 'a', 'version': None,
+                                     'note': '', 'queued_at': 'q', 'queued_by': '', 'status': 'waiting', 'count': 1, 'change': 1, 'discuss': 0},
+                                    [{'n': 1, 'tag': 'change', 'page': 3, 'text': 'words'}])
+        self.assertIn('1. **change**, page 3: "words"', text)
+
     def test_file_served_as_plain_text(self):
         iid, _ = self.queue_text('a.md', b'<script>alert(1)</script>\n')
         with urllib.request.urlopen(self.base + '/api/items/%s/file' % iid) as r:

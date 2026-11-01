@@ -94,7 +94,11 @@ A `.txt`, `.md`, `.markdown`, or `.tex` file (UTF-8, up to 5 MB) opens in an edi
 - **Done** saves first, then marks the item finished. A finished or replaced item is read-only until you tap Reopen.
 - **Images.** Each image the text refers to (`![](...)` or `<img>` in Markdown, and `\includegraphics` in LaTeX or in raw LaTeX inside Markdown, including PDF figures and `\graphicspath`) shows under the line that refers to it. **Images** lists them in the order of the text; tap one to jump to it. Tap an image to open it by itself. `review.py queue` and `push` bring along any image in the file's folder or git repository, and nothing from outside it. They look where the reference says, then for the one file with that name under a `figures`, `figs`, or `images` folder beside the text file or one folder up. An image that did not come along shows an **Add image** button.
 
-There are no voice notes in the editor: you change the text itself. The iPad keyboard's dictation works as in any text box.
+The iPad keyboard's dictation works as in any text box.
+
+**Highlights and voice notes.** Besides editing, you can mark up a text file as you would a PDF. Choose **Change pen** or **Discuss pen**, then draw across words with an Apple Pencil (or a mouse): the whole words it crosses are highlighted, and nothing is written by hand. Fingers still scroll. Right after a highlight, tap **Record** to leave a voice note; later, tap its number in the margin, or the highlight itself while a pen is chosen, to open its panel. **List** shows them all. With **Edit** chosen, select text with a finger, a mouse, or visual mode and tap Change or Discuss. While a pen is chosen the editor takes no typing, so the keyboard stays away. On a touch screen a file opens with a pen chosen, and each device remembers your choice.
+
+Highlights move with the text as you edit it. If you delete all of a highlight's words it stays in the list, with its voice notes, marked as gone. If the text is replaced (Revert, or using another device's version), each highlight finds its words again nearby, if they are still there. Markdown highlights also show in the Preview, though you draw them in the editor.
 
 ## Versions
 
@@ -153,7 +157,7 @@ Then:
 
 - Pair each thing the reviewer says with a highlight by the number they say, by the words they read aloud from it, or by order. Voice notes are the reviewer's comments on that highlight, in their words.
 - "Change" highlights mark text they want changed. "Discuss" highlights mark things to raise with them; they are not edits to make on your own.
-- Highlights belong to the copy in the item folder. If the draft has changed since it was queued (compare `sha256` in `request.json`), say so before applying anything.
+- Highlights belong to the copy in the item folder. If the draft has changed since it was queued (compare `sha256` in `request.json`), say so before applying anything. On a text file they follow the reviewer's edits: their line numbers are in `edited/<name>` if it exists, and `show` and `pull` print the highlights first and then the diff.
 - Do not edit `highlights.json` or `done.json`; the server writes them.
 
 For a text file, queue or push it the same way. `show` and `pull` print a diff of the reviewer's edits, or say there were none. `show --json` and `/api/items/<id>` give `text.original`, `text.current`, `text.diff`, and `text.edited`; the edited file is also at `edited/<name>` in the item folder. Apply the edits from `current`, and do not write to `edited/` yourself. As with PDFs, only `done` means the reviewer finished.

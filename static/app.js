@@ -137,7 +137,7 @@
       (i.status === 'done' ? ' &middot; done ' + esc(fmtTime(i.done_at)) : '') +
       (i.status === 'superseded' ? ' &middot; ' + replacedBy(i) : '') + '</div>' +
       (i.note ? '<div class="card-note">' + esc(i.note) + '</div>' : '') +
-      '<div class="card-counts">' + (i.kind === 'text' ? (i.edited ? 'Text file, edited' : 'Text file, no edits yet') : i.count ? i.count + ' highlight' + (i.count === 1 ? '' : 's') + ': ' + i.change + ' change, ' + i.discuss + ' discuss' : 'No highlights yet') + '</div>' +
+      '<div class="card-counts">' + (i.kind === 'text' ? [i.edited ? 'Text file, edited' : 'Text file, no edits yet', i.count ? i.count + ' highlight' + (i.count === 1 ? '' : 's') : '', i.voice_notes ? i.voice_notes + ' voice note' + (i.voice_notes === 1 ? '' : 's') : ''].filter(Boolean).join(', ') : i.count ? i.count + ' highlight' + (i.count === 1 ? '' : 's') + ': ' + i.change + ' change, ' + i.discuss + ' discuss' : 'No highlights yet') + '</div>' +
       '</a>' + (older && older.length ? olderBlock(older) : '') + '</div>';
     Q.cards = new Map(cards.map(c => [c.item.id, c]));
     q.innerHTML = '<h2>Waiting <span class="count">' + cards.length + '</span></h2>' +
@@ -276,7 +276,7 @@
     nodes: new Map(),  // figures already built, kept so they need not load again
     addRef: null,
   };
-  const CM = '/static/codemirror/', CM_VERSION = '?v=5';   // these files are cached; raise this when they change
+  const CM = '/static/codemirror/', CM_VERSION = '?v=6';   // these files are cached; raise this when they change
   const pref = {
     get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
     set(k, v) { try { localStorage.setItem(k, v); } catch (e) { /* not remembered */ } },
@@ -345,13 +345,20 @@
     T.cm.on('vim-mode-change', e => showVimMode(e.mode + (e.subMode ? ' ' + e.subMode : '')));
     showVimMode('normal');
     refreshChanges(); refreshImages(); updateWords();
+    T.cm.on('change', (_c, ch) => { if (ch.origin === 'setValue') TX.reanchor = true; });
+    T.cm.on('update', scheduleBadges);
+    T.cm.on('cursorActivity', noteTextSelection);
+    anchorHighlights();
+    placeHighlights();
+    setTextTool(pref.get('review.textTool') || (window.matchMedia('(pointer: coarse)').matches ? 'change' : 'edit'));
     PV.figures = new Map();
     $('#previewBtn').hidden = !isMarkdown();
     setPreview(isMarkdown() && pref.get('review.preview') === '1');
     setStatus(t.edited ? 'Saved' : '');
-    if (!S.reopen && window.matchMedia('(pointer: fine)').matches) T.cm.focus();
+    if (!S.reopen && S.textTool === 'edit' && window.matchMedia('(pointer: fine)').matches) T.cm.focus();
     restorePlace();
     T.cm.on('cursorActivity', notePlace);
+    pollTranscripts();
   }
 
   function closeText() {
@@ -359,7 +366,9 @@
     if (window.reviewVim) window.reviewVim.detach();
     setPreview(false);
     $('#previewBtn').hidden = true;
-    clearTimeout(T.timer); clearTimeout(T.refreshTimer);
+    clearTimeout(T.timer); clearTimeout(T.refreshTimer); clearTimeout(TX.selTimer);
+    cancelAnimationFrame(TX.frame); cancelAnimationFrame(TX.badgeFrame);
+    TX.marks.clear(); TX.trial = null; TX.stroke = null; TX.tap = null; TX.reanchor = false;
     T.cm = null; T.dirty = false; T.conflict = null;
     $('#editor').innerHTML = ''; $('#editor').hidden = true; $('#textTools').hidden = true;
     $('#imagesPanel').hidden = true; $('#conflict').hidden = true; $('#vimMode').hidden = true;
@@ -485,7 +494,7 @@
     if (!T.typingSince) T.typingSince = now;
     T.timer = setTimeout(saveText, now - T.typingSince > 4000 ? 0 : 600);
     clearTimeout(T.refreshTimer);
-    T.refreshTimer = setTimeout(() => { if (T.cm) { keepDraft(); refreshChanges(); refreshImages(); updateWords(); renderPreview(true); } }, 250);
+    T.refreshTimer = setTimeout(() => { if (T.cm) { keepDraft(); refreshChanges(); refreshImages(); updateWords(); followEdits(); renderPreview(true); } }, 250);
   }
 
   function updateWords() {
@@ -824,7 +833,8 @@
   // those become <mark> afterwards. Raw HTML from the file is shown as text, never run.
   const PV = { on: false, blocks: [], figures: new Map(), ready: false, driver: 'editor', sizes: '', expectPage: null, expectBox: null, observer: null, body: null };
   const MARK_START = '', MARK_END = '', MARK_GONE = '';
-  const noMarks = s => String(s || '').replace(/[-]|%EE%80%9[0-2]/gi, '');
+  const HL_CHANGE = '\uE013', HL_DISCUSS = '\uE014', HL_END = '\uE015';   // highlights, the same way
+  const noMarks = s => String(s || '').replace(/[-]|%EE%80%9[0-5]/gi, '');
   const isMarkdown = () => !!S.item && /\.(md|markdown)$/i.test(S.item.file || '');
 
   // Turn the bits of LaTeX that Markdown drafts carry into HTML. Takes text that is already escaped.
@@ -883,6 +893,19 @@
       add(x.line, x.to, MARK_END, 0);
     }
     for (const x of gone) if (lines[x.line]) add(x.line, x.ch, MARK_GONE, 2);
+    for (const h of S.hl) {
+      const a = h.anchor;
+      if (!a) continue;
+      for (let l = a.line; l <= a.end_line && l < lines.length; l++) {
+        // Fences and rules must stay as they are, or the Markdown around them stops parsing.
+        if (/^\s*(?:```|~~~|[-=*_]{3,}\s*$)/.test(lines[l])) continue;
+        const lead = /^\s*(?:(?:[-*+]|\d+[.)]|#{1,6}|>)\s+)*/.exec(lines[l])[0].length;
+        const from = Math.max(l === a.line ? a.ch : 0, lead), to = l === a.end_line ? a.end_ch : lines[l].length;
+        if (from >= to) continue;
+        add(l, from, h.tag === 'discuss' ? HL_DISCUSS : HL_CHANGE, 1);
+        add(l, to, HL_END, 0);
+      }
+    }
     return lines.map((text, n) => {
       const list = edits.get(n);
       if (!list) return text;
@@ -907,7 +930,8 @@
       line += count;
     }
     box.innerHTML = '<div class="pv-body">' + html.split(MARK_START).join('<mark class="pv-new">').split(MARK_END).join('</mark>')
-      .split(MARK_GONE).join('<span class="pv-gone"></span>') + '</div>';
+      .split(MARK_GONE).join('<span class="pv-gone"></span>').split(HL_CHANGE).join('<mark class="pv-hl change">')
+      .split(HL_DISCUSS).join('<mark class="pv-hl discuss">').split(HL_END).join('</mark>') + '</div>';
     const seen = {};
     $$('.pv-fig', box).forEach(el => {
       const ref = el.dataset.ref, alt = el.dataset.alt;
@@ -1037,9 +1061,244 @@
     if (PV.on) { PV.driver = 'editor'; renderPreview(); }
   }
   $('#previewBtn').addEventListener('click', () => {
+    // The column changes width and the text rewraps: stay on the same words.
+    const cm = T.cm, y = READING_LINE * window.innerHeight, far = window.scrollY > 2;
+    const at = cm && far ? cm.coordsChar({ left: cm.getWrapperElement().getBoundingClientRect().left + 8, top: y }, 'window') : null;
     setPreview(!PV.on);
     pref.set('review.preview', PV.on ? '1' : '0');
+    if (at) window.scrollTo(window.scrollX, cm.charCoords(at, 'page').top - y);
   });
+
+  // ------------------------------------------------------------ highlights in a text file
+
+  // In the editor a highlight is a mark, so it moves with the text as it is edited. It is saved as a line and column
+  // with the words it covers, which find it again if the text has changed since. A Pencil stroke marks the words it
+  // crosses; nothing is written by hand. While a pen is chosen the editor takes no input, so neither Scribble nor the
+  // keyboard can step in, and fingers still scroll.
+  const TX = { marks: new Map(), trial: null, stroke: null, tap: null, frame: 0, badgeFrame: 0, selTimer: null, reanchor: false };
+  const anchorOf = f => ({ line: f.from.line, ch: f.from.ch, end_line: f.to.line, end_ch: f.to.ch });
+  const sameAnchor = (a, b) => (!a && !b) || (!!a && !!b && a.line === b.line && a.ch === b.ch && a.end_line === b.end_line && a.end_ch === b.end_ch);
+  const fromOf = a => ({ line: a.line, ch: a.ch }), toOf = a => ({ line: a.end_line, ch: a.end_ch });
+
+  function placeOf(h) {
+    if (h.rects && h.rects.length) return 'page ' + h.page;
+    return h.anchor ? 'line ' + (h.anchor.line + 1) : 'its text is gone';
+  }
+
+  // Where this highlight's words are now: where they were, or else the nearest place they appear.
+  function findWords(h) {
+    const cm = T.cm, a = h.anchor;
+    if (a && cm.getRange(fromOf(a), toOf(a), '\n') === h.text) return a;
+    if (!h.text) return null;
+    const all = cm.getValue('\n'), want = a ? a.line : (h.page || 1) - 1;
+    let best = null;
+    for (let i = all.indexOf(h.text); i >= 0; i = all.indexOf(h.text, i + 1)) {
+      const line = cm.posFromIndex(i).line;
+      if (!best || Math.abs(line - want) < Math.abs(best.line - want)) best = { i, line };
+    }
+    return best && anchorOf({ from: cm.posFromIndex(best.i), to: cm.posFromIndex(best.i + h.text.length) });
+  }
+  function anchorHighlights() {
+    let changed = false;
+    for (const h of S.hl) {
+      const a = findWords(h);
+      if (!sameAnchor(a, h.anchor)) { h.anchor = a; if (a) h.page = a.line + 1; changed = true; }
+    }
+    TX.reanchor = false;
+    return changed;
+  }
+  // After edits: where the marks have moved to, and the words they now cover. A highlight whose words were all deleted
+  // stays, with its voice notes, and keeps the words it last had.
+  function readMarks() {
+    let changed = false;
+    for (const h of S.hl) {
+      const m = TX.marks.get(h.id);
+      if (!m) continue;
+      const f = m.find(), a = f ? anchorOf(f) : null, text = f ? T.cm.getRange(f.from, f.to, '\n') : h.text;
+      if (sameAnchor(a, h.anchor) && text === h.text) continue;
+      h.anchor = a; h.text = text;
+      if (a) h.page = a.line + 1;
+      h.updated_at = isoLocal();
+      changed = true;
+    }
+    return changed;
+  }
+  function placeHighlights() {
+    const cm = T.cm;
+    cm.operation(() => {
+      TX.marks.forEach(m => m.clear());
+      TX.marks.clear();
+      for (const h of S.hl) {
+        if (h.anchor) TX.marks.set(h.id, cm.markText(fromOf(h.anchor), toOf(h.anchor), { className: 'cm-hl-' + h.tag + (S.openN === h.n ? ' cm-hl-open' : '') }));
+      }
+    });
+    drawBadges();
+  }
+  function followEdits() {
+    if (!S.hl.length) return;
+    if (TX.reanchor) {            // the whole text was replaced, which takes the marks with it
+      if (anchorHighlights()) scheduleSave();
+      placeHighlights();
+    } else if (readMarks()) scheduleSave();
+  }
+  function redrawTextHighlights() {
+    if (TX.reanchor) anchorHighlights();
+    else if (readMarks()) scheduleSave();
+    placeHighlights();
+    renderPreview();
+  }
+
+  // Numbers in the margin, as on a PDF: they do not disturb the text, its wrapping, or the cursor's movement.
+  function scheduleBadges() {
+    cancelAnimationFrame(TX.badgeFrame);
+    TX.badgeFrame = requestAnimationFrame(drawBadges);
+  }
+  function drawBadges() {
+    const cm = T.cm, ed = $('#editor');
+    if (!cm) return;
+    let box = $('#hlBadges');
+    if (!box) { box = document.createElement('div'); box.id = 'hlBadges'; ed.appendChild(box); }
+    box.innerHTML = '';
+    const base = ed.getBoundingClientRect(), left = Math.max(0, cm.getWrapperElement().getBoundingClientRect().left - base.left - 34);
+    const placed = [];
+    for (const h of S.hl) {
+      if (!h.anchor) continue;
+      const c = cm.charCoords(fromOf(h.anchor), 'window'), y = (c.top + c.bottom) / 2 - base.top;
+      const k = placed.filter(p => Math.abs(p - y) < 14).length;
+      placed.push(y);
+      const b = document.createElement('div');
+      b.className = 'badge ' + h.tag + (h.note ? ' noted' : '') + (h.audio && h.audio.length ? ' voiced' : '');
+      b.dataset.n = String(h.n);
+      b.textContent = h.n;
+      b.style.top = y + 'px';
+      b.style.left = Math.max(0, left - k * 30) + 'px';
+      box.appendChild(b);
+    }
+  }
+
+  function setTextTool(tool) {
+    S.textTool = tool;
+    pref.set('review.textTool', tool);
+    $$('[data-ttool]').forEach(b => b.classList.toggle('on', b.dataset.ttool === tool));
+    $('#editor').classList.toggle('drawing', tool !== 'edit');
+    applyReadOnly();
+    if (tool !== 'edit') {
+      $('#selbar').hidden = true;
+      if (T.cm && T.cm.somethingSelected()) T.cm.setCursor(T.cm.getCursor());
+    } else if (T.cm && !S.reopen && window.matchMedia('(pointer: fine)').matches) T.cm.focus();
+  }
+  function applyReadOnly() {
+    if (T.cm) T.cm.setOption('readOnly', S.reopen ? true : S.textTool === 'edit' ? false : 'nocursor');
+  }
+  $$('[data-ttool]').forEach(b => b.addEventListener('click', () => setTextTool(b.dataset.ttool)));
+  // Typing with a pen chosen would otherwise seem to do nothing.
+  document.addEventListener('keydown', e => {
+    if (!T.cm || S.reopen || S.textTool === 'edit' || e.key.length !== 1 || e.ctrlKey || e.metaKey || e.altKey) return;
+    if (/^(INPUT|TEXTAREA)$/.test(e.target.tagName)) return;
+    toast('A pen is chosen. Tap Edit to type.');
+  });
+
+  // The words a stroke crosses, without the spaces at either end. Null if there are none.
+  function wordsBetween(a, b) {
+    const cm = T.cm, first = CodeMirror.cmpPos(a, b) <= 0;
+    return trimmed(cm.findWordAt(first ? a : b).anchor, cm.findWordAt(first ? b : a).head);
+  }
+  function trimmed(from, to) {
+    const cm = T.cm, text = cm.getRange(from, to, '\n');
+    if (!text.trim()) return null;
+    const start = cm.indexFromPos(from), lead = text.length - text.trimStart().length;
+    return { from: cm.posFromIndex(start + lead), to: cm.posFromIndex(start + text.trimEnd().length) };
+  }
+  function addTextHighlight(r, tag) {
+    if (S.reopen) { toast('Reopen it to add highlights'); return; }
+    if (!r) { toast('No text there'); return; }
+    const t = isoLocal(), anchor = anchorOf(r);
+    S.maxN = Math.max(S.maxN, S.hl.reduce((m, h) => Math.max(m, h.n || 0), 0)) + 1;
+    const h = { n: S.maxN, id: newId(), tag, page: anchor.line + 1, text: T.cm.getRange(r.from, r.to, '\n'), note: '', rects: [], anchor, created_at: t, updated_at: t };
+    S.hl.push(h);
+    redrawAll();
+    scheduleSave();
+    showBar('#' + h.n + ' ' + h.tag + ': ' + h.text.slice(0, 60) + (h.text.length > 60 ? '…' : ''), { type: 'add', id: h.id }, true);
+  }
+  function showTrial(r, tag) {
+    if (TX.trial) TX.trial.clear();
+    TX.trial = r ? T.cm.markText(r.from, r.to, { className: 'cm-hl-' + tag + ' cm-hl-trial' }) : null;
+  }
+
+  const editorEl = $('#editor');
+  editorEl.addEventListener('touchstart', e => {
+    if (!T.cm || S.textTool === 'edit') return;
+    if (Array.from(e.touches).some(t => t.touchType === 'stylus')) { e.preventDefault(); e.stopPropagation(); }
+  }, { passive: false, capture: true });
+  // A hand drifts: within most of a row of where the stroke began, it stays on that row.
+  function strokePos(e) {
+    const s = TX.stroke, y = s && Math.abs(e.clientY - s.y0) < 0.7 * T.cm.defaultTextHeight() ? s.y0 : e.clientY;
+    return T.cm.coordsChar({ left: e.clientX, top: y }, 'window');
+  }
+  editorEl.addEventListener('pointerdown', e => {
+    if (!T.cm) return;
+    const badge = e.target.closest && e.target.closest('#hlBadges .badge');
+    TX.tap = { x: e.clientX, y: e.clientY, t: Date.now(), n: badge ? Number(badge.dataset.n) : null };
+    if (badge) { e.stopPropagation(); return; }
+    if (S.textTool === 'edit' || e.button > 0 || e.pointerType === 'touch' || (e.target.closest && e.target.closest('.cm-figure'))) return;
+    e.preventDefault(); e.stopPropagation();
+    try { editorEl.setPointerCapture(e.pointerId); } catch (err) { /* synthetic events */ }
+    TX.stroke = { id: e.pointerId, x0: e.clientX, y0: e.clientY, tag: S.textTool, moved: false };
+    TX.stroke.a = strokePos(e);
+  }, true);
+  editorEl.addEventListener('pointermove', e => {
+    const s = TX.stroke;
+    if (!s || e.pointerId !== s.id) return;
+    e.preventDefault();
+    if (Math.hypot(e.clientX - s.x0, e.clientY - s.y0) < 6) return;
+    s.moved = true;
+    const b = strokePos(e);
+    cancelAnimationFrame(TX.frame);
+    TX.frame = requestAnimationFrame(() => { if (TX.stroke === s) showTrial(wordsBetween(s.a, b), s.tag); });
+  }, true);
+  editorEl.addEventListener('pointerup', e => {
+    const t = TX.tap, s = TX.stroke;
+    TX.tap = null;
+    if (!T.cm) return;
+    if (s && e.pointerId === s.id) {
+      const b = strokePos(e);
+      TX.stroke = null;
+      cancelAnimationFrame(TX.frame);
+      showTrial(null);
+      if (s.moved) { addTextHighlight(wordsBetween(s.a, b), s.tag); return; }
+    }
+    if (!t || Math.hypot(e.clientX - t.x, e.clientY - t.y) >= 8 || Date.now() - t.t >= 500) return;
+    if (t.n !== null) { openSheet(t.n); return; }
+    if (S.textTool === 'edit') return;
+    const pos = T.cm.coordsChar({ left: e.clientX, top: e.clientY }, 'window');
+    const here = T.cm.findMarksAt(pos);
+    for (const h of S.hl) if (here.includes(TX.marks.get(h.id))) { openSheet(h.n); return; }
+  }, true);
+  editorEl.addEventListener('pointercancel', () => {
+    TX.stroke = null; TX.tap = null;
+    cancelAnimationFrame(TX.frame);
+    if (T.cm) showTrial(null);
+  }, true);
+
+  // A selection made by finger, mouse, or visual mode can be marked too.
+  function noteTextSelection() {
+    clearTimeout(TX.selTimer);
+    TX.selTimer = setTimeout(() => {
+      const cm = T.cm;
+      if (!cm) return;
+      const show = !S.reopen && S.textTool === 'edit' && cm.somethingSelected() && cm.listSelections().length === 1;
+      $('#selbar').hidden = !show;
+      if (show) $('#lastbar').hidden = true;
+    }, 150);
+  }
+  function markTextSelection(tag) {
+    const cm = T.cm, s = cm.listSelections()[0], first = CodeMirror.cmpPos(s.anchor, s.head) <= 0;
+    const r = trimmed(first ? s.anchor : s.head, first ? s.head : s.anchor);
+    $('#selbar').hidden = true;
+    addTextHighlight(r, tag);
+    if (cm.state.vim && cm.state.vim.visualMode) CodeMirror.Vim.exitVisualMode(cm);
+    else cm.setCursor(first ? s.head : s.anchor);
+  }
 
   // ------------------------------------------------------------ viewer
 
@@ -1157,7 +1416,11 @@
       P.over.appendChild(b);
     }
   }
-  function redrawAll() { S.pages.forEach(drawHighlights); if (!$('#list').hidden) renderList(); }
+  function redrawAll() {
+    S.pages.forEach(drawHighlights);
+    if (T.cm) redrawTextHighlights();
+    if (!$('#list').hidden) renderList();
+  }
 
   function preview(range, tag) {
     clearPreview();
@@ -1361,6 +1624,7 @@
   let selTimer = null;
   document.addEventListener('selectionchange', () => { clearTimeout(selTimer); selTimer = setTimeout(onSelection, 180); });
   function onSelection() {
+    if (T.cm) return;                  // the editor keeps its own selection: noteTextSelection
     if (!S.item || !S.pages.length || S.tool !== 'select') { $('#selbar').hidden = true; return; }
     const sel = window.getSelection();
     if (!sel || !sel.rangeCount || sel.isCollapsed) { $('#selbar').hidden = true; return; }
@@ -1374,6 +1638,7 @@
     b.addEventListener('pointerdown', e => e.preventDefault());   // keep the selection while tapping
     b.addEventListener('mousedown', e => e.preventDefault());
     b.addEventListener('click', () => {
+      if (T.cm) { markTextSelection(b.dataset.mark); return; }
       const r = S.lastRange;
       $('#selbar').hidden = true;
       const sel = window.getSelection(); if (sel) sel.removeAllRanges();
@@ -1468,7 +1733,7 @@
     commitNote();                      // the note still being typed belongs to the highlight it was typed for
     S.openN = n;
     $('#sheetNum').textContent = '#' + h.n;
-    $('#sheetPage').textContent = 'page ' + h.page;
+    $('#sheetPage').textContent = placeOf(h);
     const q = $('#sheetQuote');
     q.textContent = h.text; q.className = h.tag;
     $$('[data-settag]').forEach(b => b.classList.toggle('on', b.dataset.settag === h.tag));
@@ -1486,6 +1751,7 @@
     $('#sheetNote').blur();
     S.openN = null;
     redrawAll();
+    if (T.cm && !S.reopen && S.textTool === 'edit' && window.matchMedia('(pointer: fine)').matches) T.cm.focus();
   }
   function commitNote() {
     const h = S.hl.find(x => x.n === S.openN);
@@ -1686,12 +1952,14 @@
 
   // ------------------------------------------------------------ list of highlights
 
-  $('#listBtn').addEventListener('click', () => {
+  const toggleList = () => {
     const L = $('#list');
     if (!L.hidden) { L.hidden = true; return; }
     L.style.top = $('#bar').getBoundingClientRect().bottom + 'px';
     renderList(); L.hidden = false;
-  });
+  };
+  $('#listBtn').addEventListener('click', toggleList);
+  $('#textListBtn').addEventListener('click', toggleList);
   function renderList() {
     const L = $('#list');
     const items = S.hl.slice().sort((a, b) => a.n - b.n);
@@ -1703,13 +1971,17 @@
         '<div class="li-text">' + esc(h.text.length > 220 ? h.text.slice(0, 220) + '…' : h.text) + '</div>' +
         (h.note ? '<div class="li-note">' + esc(h.note) + '</div>' : '') +
         (h.audio || []).map((c, k) => '<div class="li-voice">Voice note ' + (k + 1) + ' (' + clockStr(c.seconds) + '): ' + clipStatus(c.file) + '</div>').join('') +
-        '<div class="li-meta">page ' + h.page + ' &middot; ' + h.tag + '</div></div></div>').join('')
+        '<div class="li-meta">' + placeOf(h) + ' &middot; ' + h.tag + '</div></div></div>').join('')
         : '<p class="muted">No highlights yet.</p>');
     $('#listClose').addEventListener('click', () => { L.hidden = true; });
     $$('.li', L).forEach(el => el.addEventListener('click', () => {
       const h = S.hl.find(x => String(x.n) === el.dataset.n);
       if (!h) return;
-      const P = S.pages[h.rects[0].page - 1];
+      if (T.cm && h.anchor) {
+        const y = T.cm.charCoords(fromOf(h.anchor), 'page').top - $('#bar').offsetHeight - 80;
+        window.scrollTo({ top: Math.max(0, y), behavior: 'smooth' });
+      }
+      const P = h.rects && h.rects.length ? S.pages[h.rects[0].page - 1] : null;
       if (P) {
         const y = P.div.getBoundingClientRect().top + window.scrollY + h.rects[0].y * P.scale - $('#bar').offsetHeight - 80;
         window.scrollTo({ top: Math.max(0, y), behavior: 'smooth' });
@@ -1799,7 +2071,7 @@
     }
     if (i && i.kind === 'text' && i.status === 'done') lines.push('<b>Done</b> ' + esc(fmtTime(i.done_at)) + '. Reopen to edit it again.');
     if (i && i.note) lines.push('<b>Note:</b> ' + esc(i.note));
-    if (T.cm) T.cm.setOption('readOnly', S.reopen);
+    applyReadOnly();
     brief.hidden = !lines.length;
     brief.innerHTML = lines.map(l => '<div>' + l + '</div>').join('');
   }
@@ -1814,7 +2086,7 @@
         updateDoneBtn(); toast('Reopened');
       } else {
         S.item = (await api('/api/items/' + S.item.id + '/done', { method: 'POST', body: '{}' })).item;
-        toast(S.item.kind === 'text' ? (S.item.edited ? 'Done: your edits are saved' : 'Done: no edits') :
+        toast(S.item.kind === 'text' ? (S.item.count ? 'Done: ' + marks(S.item) + ' saved' : S.item.edited ? 'Done: your edits are saved' : 'Done: no edits') :
           'Done: ' + S.item.count + ' highlight' + (S.item.count === 1 ? '' : 's') + ' saved', 3000);
         location.hash = '#/';
       }
@@ -1822,7 +2094,7 @@
   });
 
   // test hook for automated checks
-  window.__review = { S, T, PV, boundaryAt, rangeBetween, addFromRange, rangeText, rangeParts, save, flush };
+  window.__review = { S, T, PV, TX, boundaryAt, rangeBetween, addFromRange, rangeText, rangeParts, save, flush };
 
   route();
 })();
