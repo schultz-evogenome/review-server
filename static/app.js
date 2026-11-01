@@ -282,6 +282,35 @@
     set(k, v) { try { localStorage.setItem(k, v); } catch (e) { /* not remembered */ } },
   };
 
+  // The size of the text in the editor, per device.
+  const TEXT_SIZE = { least: 12, most: 30, usual: 18 };
+  function textSize() {
+    const n = parseInt(pref.get('review.textSize'), 10);
+    return n >= TEXT_SIZE.least && n <= TEXT_SIZE.most ? n : TEXT_SIZE.usual;
+  }
+  function showTextSize() {
+    const n = textSize();
+    document.documentElement.style.setProperty('--editor-size', n + 'px');
+    $('#sizeDown').disabled = n <= TEXT_SIZE.least;
+    $('#sizeUp').disabled = n >= TEXT_SIZE.most;
+  }
+  function stepTextSize(by) {
+    const n = Math.min(TEXT_SIZE.most, Math.max(TEXT_SIZE.least, textSize() + by));
+    keepingWords(() => {
+      pref.set('review.textSize', String(n));
+      showTextSize();
+      if (T.cm) T.cm.refresh();
+    });
+    scheduleBadges();
+    toast('Text size ' + n);
+  }
+  [['#sizeDown', -1], ['#sizeUp', 1]].forEach(([sel, by]) => {
+    const b = $(sel);
+    b.addEventListener('mousedown', e => e.preventDefault());      // the editor keeps the keyboard
+    b.addEventListener('click', () => stepTextSize(by));
+  });
+  showTextSize();
+
   let cmReady = null;
   function loadEditor() {
     if (cmReady) return cmReady;
@@ -853,7 +882,8 @@
     const figs = [];
     const rest = code.replace(/\\includegraphics\s*(?:\[[^\]]*\]\s*)?\{([^}]+)\}/g, (_m, ref) => { figs.push(ref.trim()); return ''; })
       .replace(/\\(?:begin|end)\{[^}]*\}(?:\[[^\]]*\])?/g, '').replace(/\\(?:vspace|hspace|label)\*?\{[^}]*\}/g, '')
-      .replace(/\\(?:centering|raggedright|par|newpage|noindent|clearpage|smallskip|medskip|bigskip)\b/g, '');
+      .replace(/\\caption(?:of)?\*?(?:\{figure\})?(?:\[[^\]]*\])?/g, '')
+      .replace(/\\(?:centering|raggedright|par|newpage|noindent|clearpage|smallskip|medskip|bigskip|small|footnotesize|scriptsize)\b/g, '');
     const caption = latexInline(esc(rest)).replace(/[{}]/g, '').replace(/~/g, ' ').trim();
     if (!figs.length && !noMarks(caption).trim()) return '';
     return '<div class="pv-latex">' + figs.map(r => figurePlaceholder(r, '')).join('') + (noMarks(caption).trim() ? '<p class="pv-caption">' + caption + '</p>' : '') + '</div>';
@@ -1061,13 +1091,18 @@
     if (PV.on) { PV.driver = 'editor'; renderPreview(); }
   }
   $('#previewBtn').addEventListener('click', () => {
-    // The column changes width and the text rewraps: stay on the same words.
-    const cm = T.cm, y = READING_LINE * window.innerHeight, far = window.scrollY > 2;
-    const at = cm && far ? cm.coordsChar({ left: cm.getWrapperElement().getBoundingClientRect().left + 8, top: y }, 'window') : null;
-    setPreview(!PV.on);
-    pref.set('review.preview', PV.on ? '1' : '0');
-    if (at) window.scrollTo(window.scrollX, cm.charCoords(at, 'page').top - y);
+    keepingWords(() => {
+      setPreview(!PV.on);
+      pref.set('review.preview', PV.on ? '1' : '0');
+    });
   });
+  // The text is about to rewrap: stay on the same words.
+  function keepingWords(change) {
+    const cm = T.cm, y = READING_LINE * window.innerHeight;
+    const at = cm && window.scrollY > 2 ? cm.coordsChar({ left: cm.getWrapperElement().getBoundingClientRect().left + 8, top: y }, 'window') : null;
+    change();
+    if (at) window.scrollTo(window.scrollX, cm.charCoords(at, 'page').top - y);
+  }
 
   // ------------------------------------------------------------ highlights in a text file
 
@@ -1181,6 +1216,7 @@
     pref.set('review.textTool', tool);
     $$('[data-ttool]').forEach(b => b.classList.toggle('on', b.dataset.ttool === tool));
     $('#editor').classList.toggle('drawing', tool !== 'edit');
+    $('#preview').classList.toggle('drawing', tool !== 'edit');
     applyReadOnly();
     if (tool !== 'edit') {
       $('#selbar').hidden = true;
@@ -1298,6 +1334,205 @@
     addTextHighlight(r, tag);
     if (cm.state.vim && cm.state.vim.visualMode) CodeMirror.Vim.exitVisualMode(cm);
     else cm.setCursor(first ? s.head : s.anchor);
+  }
+
+  // ------------------------------------------------------------ highlights drawn in the preview
+
+  // What is rendered is not what is written: *word*, renders as word, and \\emph{word} as word. Each rendered block knows
+  // its lines, so its words are found in order among those lines, passing over markup. A highlight made here is then the
+  // same as one made in the editor, on the same words of the source.
+  const MARKUP = new Set('*_`~\\{}$');
+  const wordChar = c => /[\p{L}\p{N}]/u.test(c || '');
+  function matchWord(src, word, from) {
+    for (let k = src.indexOf(word[0], from); k >= 0 && k <= from + 600; k = src.indexOf(word[0], k + 1)) {
+      if (wordChar(word[0]) && wordChar(src[k - 1])) continue;
+      let m = k + 1, i = 1;
+      for (; i < word.length; i++, m++) {
+        while (m < src.length && src[m] !== word[i] && MARKUP.has(src[m])) m++;
+        if (src[m] !== word[i]) break;
+      }
+      if (i === word.length && !(wordChar(word[word.length - 1]) && wordChar(src[m]))) return { s: k, e: m };
+    }
+    return null;
+  }
+  function blockTexts(block) {
+    const walk = document.createTreeWalker(block, NodeFilter.SHOW_TEXT), nodes = [];
+    let at = 0, text = '';
+    for (let n = walk.nextNode(); n; n = walk.nextNode()) {
+      if (n.parentElement.closest('.cm-figure')) continue;
+      nodes.push({ node: n, at });
+      at += n.data.length;
+      text += n.data;
+    }
+    return { nodes, text };
+  }
+  function blockWords(block) {
+    const cm = T.cm, from = Number(block.dataset.from), start = { line: from, ch: 0 };
+    const src = cm.getRange(start, { line: Number(block.dataset.to) + 1, ch: 0 }, '\n'), base = cm.indexFromPos(start);
+    const words = [];
+    let j = 0;
+    for (const w of blockTexts(block).text.matchAll(/\S+/g)) {
+      const hit = matchWord(src, w[0], j);
+      if (hit) j = hit.e;
+      // The letters of the word, without punctuation around it: a stroke takes the comma only if it reaches the comma.
+      const r0 = w.index, r1 = r0 + w[0].length;
+      const lead = (/^[^\p{L}\p{N}]*/u.exec(w[0]) || [''])[0].length, tail = (/[^\p{L}\p{N}]*$/u.exec(w[0]) || [''])[0].length;
+      let s = hit ? hit.s : null, e = hit ? hit.e : null;
+      if (hit && lead < w[0].length) {
+        while (s < e && !wordChar(src[s])) s++;
+        while (e > s && !wordChar(src[e - 1])) e--;
+      }
+      words.push({ r0, r1, s: hit ? base + hit.s : null, e: hit ? base + hit.e : null, inR0: r0 + lead, inR1: r1 - tail, inS: hit ? base + s : null, inE: hit ? base + e : null });
+    }
+    return words;
+  }
+  // A point in the preview: which block, and how far along its rendered text.
+  function pointFromDom(node, off) {
+    const box = $('#preview');
+    if (!node || !box.contains(node)) return null;
+    const el = node.nodeType === 3 ? node.parentElement : node, block = el.closest('.pv-block');
+    if (!block) return null;
+    const { nodes, text } = blockTexts(block);
+    const here = nodes.find(n => n.node === node);
+    if (here) return { block, offset: here.at + off };
+    const r = document.createRange();
+    r.setStart(node, off);
+    const next = nodes.find(n => r.comparePoint(n.node, 0) >= 0);
+    return { block, offset: next ? next.at : text.length };
+  }
+  function pointAt(x, y) {
+    const box = $('#preview');
+    if (document.caretRangeFromPoint) {
+      const r = document.caretRangeFromPoint(x, y);
+      const p = r && pointFromDom(r.startContainer, r.startOffset);
+      if (p) return p;
+    } else if (document.caretPositionFromPoint) {
+      const r = document.caretPositionFromPoint(x, y);
+      const p = r && pointFromDom(r.offsetNode, r.offset);
+      if (p) return p;
+    }
+    // In a margin, or between blocks: the nearest block.
+    const blocks = $$('.pv-block', box);
+    if (!blocks.length) return null;
+    const below = blocks.find(b => b.getBoundingClientRect().bottom >= y);
+    return below ? { block: below, offset: 0 } : { block: blocks[blocks.length - 1], offset: Infinity };
+  }
+  // The source words between two points, whichever came first.
+  function sourceBetween(a, b) {
+    const flip = a.block !== b.block ? !!(a.block.compareDocumentPosition(b.block) & Node.DOCUMENT_POSITION_PRECEDING) : b.offset < a.offset;
+    const first = flip ? b : a, last = flip ? a : b;
+    const startWords = blockWords(first.block), endWords = last.block === first.block ? startWords : blockWords(last.block);
+    const start = startWords.find(w => w.r1 > first.offset && w.s !== null);
+    let end = null;
+    for (const w of endWords) if (w.r0 < last.offset && w.e !== null) end = w;
+    if (first.block === last.block && start && (!end || end.e <= start.s)) end = start;  // within one word
+    if (!start || !end) return null;
+    const s = first.offset >= start.inR0 ? start.inS : start.s, e = last.offset <= end.inR1 ? end.inE : end.e;
+    return e > s ? trimmed(T.cm.posFromIndex(s), T.cm.posFromIndex(e)) : null;
+  }
+  function highlightAtPoint(p) {
+    const w = blockWords(p.block).find(x => x.r1 > p.offset && x.s !== null);
+    if (!w) return null;
+    const pos = T.cm.posFromIndex(w.s), cmp = CodeMirror.cmpPos;
+    return S.hl.slice().reverse().find(h => h.anchor && cmp(fromOf(h.anchor), pos) <= 0 && cmp(pos, toOf(h.anchor)) < 0) || null;
+  }
+  function domAt(block, offset) {
+    const { nodes } = blockTexts(block);
+    let n = nodes[0];
+    for (const x of nodes) if (x.at <= offset) n = x;
+    return n && { node: n.node, off: Math.min(offset - n.at, n.node.data.length) };
+  }
+  function showPreviewTrial(a, b, tag) {
+    const box = $('#preview');
+    $$('.pv-trial', box).forEach(d => d.remove());
+    if (!a || !b) return;
+    const flip = a.block !== b.block ? !!(a.block.compareDocumentPosition(b.block) & Node.DOCUMENT_POSITION_PRECEDING) : b.offset < a.offset;
+    const from = domAt((flip ? b : a).block, (flip ? b : a).offset), to = domAt((flip ? a : b).block, (flip ? a : b).offset);
+    if (!from || !to) return;
+    const r = document.createRange();
+    r.setStart(from.node, from.off); r.setEnd(to.node, to.off);
+    const base = box.getBoundingClientRect();
+    for (const q of r.getClientRects()) {
+      const d = document.createElement('div');
+      d.className = 'pv-trial ' + tag;
+      d.style.cssText = 'left:' + (q.left - base.left + box.scrollLeft) + 'px;top:' + (q.top - base.top + box.scrollTop) + 'px;width:' + q.width + 'px;height:' + q.height + 'px';
+      box.appendChild(d);
+    }
+  }
+  const previewEl = $('#preview');
+  previewEl.addEventListener('touchstart', e => {
+    if (!T.cm || S.textTool === 'edit') return;
+    if (Array.from(e.touches).some(t => t.touchType === 'stylus')) e.preventDefault();
+  }, { passive: false });
+  const previewStrokePoint = (e, s) => {
+    const row = parseFloat(getComputedStyle(previewEl).lineHeight) || 26;
+    return pointAt(e.clientX, s && Math.abs(e.clientY - s.y0) < 0.7 * row ? s.y0 : e.clientY);
+  };
+  previewEl.addEventListener('pointerdown', e => {
+    if (!T.cm || !PV.on || S.textTool === 'edit' || e.button > 0) return;
+    TX.tap = { x: e.clientX, y: e.clientY, t: Date.now(), n: null };
+    if (e.pointerType === 'touch') return;
+    e.preventDefault();
+    try { previewEl.setPointerCapture(e.pointerId); } catch (err) { /* synthetic events */ }
+    TX.stroke = { id: e.pointerId, x0: e.clientX, y0: e.clientY, tag: S.textTool, moved: false, inPreview: true };
+    TX.stroke.a = previewStrokePoint(e, TX.stroke);
+  });
+  previewEl.addEventListener('pointermove', e => {
+    const s = TX.stroke;
+    if (!s || !s.inPreview || e.pointerId !== s.id) return;
+    e.preventDefault();
+    if (Math.hypot(e.clientX - s.x0, e.clientY - s.y0) < 6) return;
+    s.moved = true;
+    const b = previewStrokePoint(e, s);
+    cancelAnimationFrame(TX.frame);
+    TX.frame = requestAnimationFrame(() => { if (TX.stroke === s) showPreviewTrial(s.a, b, s.tag); });
+  });
+  previewEl.addEventListener('pointerup', e => {
+    const t = TX.tap, s = TX.stroke;
+    TX.tap = null;
+    if (!T.cm || !PV.on) return;
+    if (s && s.inPreview && e.pointerId === s.id) {
+      TX.stroke = null;
+      cancelAnimationFrame(TX.frame);
+      showPreviewTrial(null);
+      if (s.moved) {
+        const b = previewStrokePoint(e, s);
+        addTextHighlight(s.a && b ? sourceBetween(s.a, b) : null, s.tag);
+        return;
+      }
+    }
+    if (S.textTool === 'edit' || !t || Math.hypot(e.clientX - t.x, e.clientY - t.y) >= 8 || Date.now() - t.t >= 500) return;
+    const p = pointAt(e.clientX, e.clientY), h = p && highlightAtPoint(p);
+    if (h) openSheet(h.n);
+  });
+  previewEl.addEventListener('pointercancel', () => {
+    if (TX.stroke && TX.stroke.inPreview) TX.stroke = null;
+    TX.tap = null;
+    cancelAnimationFrame(TX.frame);
+    showPreviewTrial(null);
+  });
+  // Text selected in the preview, with Edit chosen.
+  function notePreviewSelection() {
+    if (!PV.on || S.textTool !== 'edit') return;
+    const sel = window.getSelection(), r = sel && sel.rangeCount && !sel.isCollapsed ? sel.getRangeAt(0) : null;
+    if (r && previewEl.contains(r.commonAncestorContainer)) {
+      S.lastRange = r.cloneRange();
+      $('#lastbar').hidden = true;
+      $('#selbar').hidden = false;
+    } else if (S.lastRange) {
+      S.lastRange = null;
+      if (!T.cm.somethingSelected()) $('#selbar').hidden = true;
+    }
+  }
+  function markPreviewSelection(tag) {
+    const r = S.lastRange;
+    S.lastRange = null;
+    $('#selbar').hidden = true;
+    const a = pointFromDom(r.startContainer, r.startOffset), b = pointFromDom(r.endContainer, r.endOffset);
+    const sel = window.getSelection();
+    if (sel) sel.removeAllRanges();
+    addTextHighlight(a && b ? sourceBetween(a, b) : null, tag);
+    if (T.cm && window.matchMedia('(pointer: fine)').matches) T.cm.focus();
   }
 
   // ------------------------------------------------------------ viewer
@@ -1624,7 +1859,7 @@
   let selTimer = null;
   document.addEventListener('selectionchange', () => { clearTimeout(selTimer); selTimer = setTimeout(onSelection, 180); });
   function onSelection() {
-    if (T.cm) return;                  // the editor keeps its own selection: noteTextSelection
+    if (T.cm) { notePreviewSelection(); return; }     // the editor keeps its own selection: noteTextSelection
     if (!S.item || !S.pages.length || S.tool !== 'select') { $('#selbar').hidden = true; return; }
     const sel = window.getSelection();
     if (!sel || !sel.rangeCount || sel.isCollapsed) { $('#selbar').hidden = true; return; }
@@ -1638,7 +1873,7 @@
     b.addEventListener('pointerdown', e => e.preventDefault());   // keep the selection while tapping
     b.addEventListener('mousedown', e => e.preventDefault());
     b.addEventListener('click', () => {
-      if (T.cm) { markTextSelection(b.dataset.mark); return; }
+      if (T.cm) { if (S.lastRange) markPreviewSelection(b.dataset.mark); else markTextSelection(b.dataset.mark); return; }
       const r = S.lastRange;
       $('#selbar').hidden = true;
       const sel = window.getSelection(); if (sel) sel.removeAllRanges();
@@ -2094,7 +2329,7 @@
   });
 
   // test hook for automated checks
-  window.__review = { S, T, PV, TX, boundaryAt, rangeBetween, addFromRange, rangeText, rangeParts, save, flush };
+  window.__review = { S, T, PV, TX, blockWords, pointAt, sourceBetween, boundaryAt, rangeBetween, addFromRange, rangeText, rangeParts, save, flush };
 
   route();
 })();

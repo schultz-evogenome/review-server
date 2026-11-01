@@ -250,7 +250,7 @@ body.writing #brief { max-width: 780px; margin: 12px max(16px, calc((100% - 780p
   margin: 0 auto;
   background: transparent;
   color: var(--fg);
-  font: 18px/1.65 ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  font: var(--editor-size, 18px)/1.65 ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
 }
 #editor .CodeMirror-lines { padding: 7vh 0 45vh; }
 #editor .CodeMirror pre.CodeMirror-line, #editor .CodeMirror pre.CodeMirror-line-like { padding: 0; }
@@ -313,6 +313,10 @@ body.previewing #brief { margin-right: calc(50% + 16px); margin-left: 16px; }
 #preview .pv-caption { font-size: 14px; color: var(--muted); }
 #preview mark.pv-new { background: var(--edited); color: inherit; border-radius: 2px; }
 #preview mark.pv-hl { color: inherit; border-radius: 2px; }
+#preview.drawing { cursor: crosshair; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+#preview .pv-trial { position: absolute; pointer-events: none; border-radius: 2px; outline: 1px dashed var(--muted); }
+#preview .pv-trial.change { background: var(--change); }
+#preview .pv-trial.discuss { background: var(--discuss); }
 #preview mark.pv-hl.change { background: var(--change); }
 #preview mark.pv-hl.discuss { background: var(--discuss); }
 #preview .pv-gone { display: inline-block; width: 2px; height: 1em; margin: 0 1px; vertical-align: -0.12em; background: var(--danger); opacity: 0.7; }
