@@ -75,6 +75,7 @@ The server then loads the speech model when the first clip arrives, keeps it in 
 - **Notes.** Tap a highlight or its number to change its tag, add a note (the microphone key on the keyboard dictates), or delete it. Right after you make a highlight, "Add note," "Record," and "Undo" appear for a few seconds.
 - **Voice notes.** Tap Record in a highlight's panel (or right after making the highlight), talk, and tap Stop. The clip is saved with that highlight, where you can play it back or delete it (two taps), and its text appears under it a few seconds later. Safari asks for the microphone the first time. The number in the margin shows ✎ for a note and ♪ for a voice note.
 - **List** shows every highlight with its number, text, and note. Tap one to jump to it.
+- **Swipe a card left** for **Archive** and **Trash**, as in Mail; swipe all the way to archive it, and **Undo** appears for a few seconds. On a Mac, swipe with two fingers on the trackpad, or drag with the mouse. Archiving a card archives its older waiting versions with it. Neither deletes anything: archived and trashed items keep all their files and marks, wait under **Archived** and **Trash** at the bottom of the queue, and a swipe there restores them to where they were. `show` and `pull` say when an item was archived or trashed.
 - **Done** marks the item finished and returns to the queue. Open a finished item and tap Reopen to keep working on it. Reopen also brings a replaced version back to Waiting.
 
 Everything saves as you go. If the same item is open on two devices, the changes are merged.

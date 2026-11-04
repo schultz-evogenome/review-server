@@ -424,6 +424,46 @@ class TextFiles(Base):
                                     [{'n': 1, 'tag': 'change', 'page': 3, 'text': 'words'}])
         self.assertIn('1. **change**, page 3: "words"', text)
 
+    def test_archive_and_trash_go_back_where_they_were(self):
+        waiting, p = self.queue_text('Plan_v1.md', title='The plan')
+        done, q = self.queue_text('Other_v1.md', title='Other')
+        self.save(done, 'edited\n')
+        self.assertEqual(self.call('POST', '/api/items/%s/done' % done, {})[0], 200)
+        done_at = json.loads((q / 'done.json').read_text())['done_at']
+
+        code, r = self.call('POST', '/api/items/%s/done' % waiting, {'closed_as': 'archived'})
+        self.assertEqual((code, r['item']['status']), (200, 'archived'))
+        self.assertEqual(self.call('POST', '/api/items/%s/done' % done, {'closed_as': 'trashed'})[1]['item']['status'], 'trashed')
+        self.assertEqual(self.call('POST', '/api/items/%s/done' % done, {'closed_as': 'archived'})[1]['item']['status'], 'archived')
+        self.assertTrue((p / 'Plan_v1.md').is_file() and (q / 'edited').is_dir())          # nothing deleted
+        self.assertEqual(self.call('POST', '/api/items/%s/done' % waiting, {'closed_as': 'gone'})[0], 400)
+        self.assertEqual(self.save(waiting, 'late edit\n')[0], 409)                          # put away: read-only
+
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            review.main(['show', str(p), '--root', str(self.tmp / 'repo')])
+        self.assertIn('Archived ', out.getvalue())
+        self.assertIn('without marking it done', out.getvalue())
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            review.main(['list', '--root', str(self.tmp / 'repo')])
+        self.assertNotIn('The plan', out.getvalue())                                         # out of the queue
+
+        code, r = self.call('DELETE', '/api/items/%s/done?closed_as=1' % waiting)
+        self.assertEqual((code, r['item']['status']), (200, 'waiting'))
+        self.assertFalse((p / 'done.json').exists())
+        code, r = self.call('DELETE', '/api/items/%s/done?closed_as=1' % done)
+        self.assertEqual((r['item']['status'], r['item']['done_at']), ('done', done_at))     # done, as it was
+        self.assertNotIn('closed_from', json.loads((q / 'done.json').read_text()))
+
+    def test_a_replaced_version_comes_back_replaced(self):
+        v1, p = self.queue_text('Plan_v1.md')
+        self.queue_text('Plan_v2.md')
+        self.store.sweep()
+        self.call('POST', '/api/items/%s/done' % v1, {'closed_as': 'trashed'})
+        self.assertEqual(self.items()[v1]['status'], 'trashed')
+        self.call('DELETE', '/api/items/%s/done?closed_as=1' % v1)
+        self.assertEqual(self.items()[v1]['status'], 'superseded')
+        self.assertEqual(self.store.sweep(), [])
+
     def test_file_served_as_plain_text(self):
         iid, _ = self.queue_text('a.md', b'<script>alert(1)</script>\n')
         with urllib.request.urlopen(self.base + '/api/items/%s/file' % iid) as r:

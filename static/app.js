@@ -113,7 +113,8 @@
     $('#addBtn').hidden = true;
     $('#title').textContent = 'Review queue'; document.title = 'Review queue'; setStatus('');
     const q = $('#queue');
-    q.innerHTML = '<p class="muted">Loading&hellip;</p>';
+    if (!q.querySelector('.swipe')) q.innerHTML = '<p class="muted">Loading&hellip;</p>';
+    const open = Q.open;
     let items;
     try {
       const data = await api('/api/items');
@@ -125,11 +126,16 @@
     const cards = groupWaiting(items.filter(i => i.status === 'waiting'));
     const done = items.filter(i => i.status === 'done').sort((a, b) => String(b.done_at || '').localeCompare(String(a.done_at || '')));
     const replaced = items.filter(i => i.status === 'superseded').sort((a, b) => String(b.superseded_at || '').localeCompare(String(a.superseded_at || '')));
+    const byClosing = (a, b) => String(b.closed_at || '').localeCompare(String(a.closed_at || ''));
+    const archived = items.filter(i => i.status === 'archived').sort(byClosing), trashed = items.filter(i => i.status === 'trashed').sort(byClosing);
+    const section = (key, title, list, note) => list.length ? '<details data-key="' + key + '"' + (open.has(key) ? ' open' : '') + '><summary>' + title +
+      ' <span class="count">' + list.length + '</span></summary>' + (note ? '<p class="muted">' + note + '</p>' : '') + list.map(i => card(i)).join('') + '</details>' : '';
     const replacedBy = i => {
       const n = byId.get(i.superseded_by), v = n ? n.version : i.superseded_version;
       return 'replaced by ' + (v == null ? 'a newer version' : 'v' + v) + ' &middot; closed ' + (i.superseded_auto ? 'automatically ' : '') + esc(fmtTime(i.superseded_at));
     };
-    const card = (i, older) => '<div class="card ' + i.status + '" data-id="' + i.id + '">' +
+    const card = (i, older) => '<div class="swipe" data-id="' + i.id + '" data-status="' + i.status + '">' + swipeButtons(i.status) +
+      '<div class="card ' + i.status + '" data-id="' + i.id + '">' +
       '<a class="card-link" href="#/item/' + i.id + '">' +
       '<div class="card-title">' + esc(i.title) + '</div>' +
       '<div class="card-meta">' + esc(i.folder) + (i.version == null ? '' : ' &middot; v' + i.version) +
@@ -138,19 +144,186 @@
       (i.status === 'superseded' ? ' &middot; ' + replacedBy(i) : '') + '</div>' +
       (i.note ? '<div class="card-note">' + esc(i.note) + '</div>' : '') +
       '<div class="card-counts">' + (i.kind === 'text' ? [i.edited ? 'Text file, edited' : 'Text file, no edits yet', i.count ? i.count + ' highlight' + (i.count === 1 ? '' : 's') : '', i.voice_notes ? i.voice_notes + ' voice note' + (i.voice_notes === 1 ? '' : 's') : ''].filter(Boolean).join(', ') : i.count ? i.count + ' highlight' + (i.count === 1 ? '' : 's') + ': ' + i.change + ' change, ' + i.discuss + ' discuss' : 'No highlights yet') + '</div>' +
-      '</a>' + (older && older.length ? olderBlock(older) : '') + '</div>';
+      (i.status === 'archived' || i.status === 'trashed' ? '<div class="card-meta">' + (i.status === 'archived' ? 'archived ' : 'put in the trash ') + esc(fmtTime(i.closed_at)) + '</div>' : '') +
+      '</a>' + (older && older.length ? olderBlock(older) : '') + '</div></div>';
     Q.cards = new Map(cards.map(c => [c.item.id, c]));
     q.innerHTML = '<h2>Waiting <span class="count">' + cards.length + '</span></h2>' +
       (cards.length ? cards.map(c => card(c.item, c.older)).join('') : '<p class="muted">Nothing waiting.</p>') +
-      (done.length ? '<details><summary>Done <span class="count">' + done.length + '</span></summary>' + done.map(i => card(i)).join('') + '</details>' : '') +
-      (replaced.length ? '<details><summary>Replaced <span class="count">' + replaced.length + '</span></summary>' +
-        '<p class="muted">Older versions closed when a newer one arrived. Open one and tap Reopen to put it back in Waiting.</p>' +
-        replaced.map(i => card(i)).join('') + '</details>' : '');
+      section('done', 'Done', done) +
+      section('replaced', 'Replaced', replaced, 'Older versions closed when a newer one arrived. Open one and tap Reopen to put it back in Waiting.') +
+      section('archived', 'Archived', archived, 'Put away. Swipe left on one to restore it.') +
+      section('trashed', 'Trash', trashed, 'Nothing here is deleted: the files stay where they are. Swipe left on one to restore it.');
+    SW.open = null;
   }
+
+  // ------------------------------------------------------------ swiping a card away
+
+  // As in Mail: swipe a card left to show its actions, or all the way to do the one on the right. Fingers, a pen, a
+  // mouse drag, or a two-finger swipe on a trackpad. Archive and Trash only change the item's status; Undo, or
+  // Restore from Archived or Trash, puts it back where it was.
+  const ICON = {
+    archive: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><rect x="3" y="4" width="18" height="5" rx="1.2"/><path d="M5 9v9.5A1.5 1.5 0 0 0 6.5 20h11a1.5 1.5 0 0 0 1.5-1.5V9"/><path d="M10 13h4" stroke-linecap="round"/></svg>',
+    trash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6.5h16"/><path d="M9 6.5V4.8c0-.5.4-.8.8-.8h4.4c.4 0 .8.3.8.8v1.7"/><path d="M6.2 6.5l.9 12.3c.1.7.6 1.2 1.3 1.2h7.2c.7 0 1.2-.5 1.3-1.2l.9-12.3"/><path d="M10 10.5v6M14 10.5v6"/></svg>',
+    restore: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M9 14L4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/></svg>',
+  };
+  const ACTION_LABEL = { archive: 'Archive', trash: 'Trash', restore: 'Restore' };
+  // The rightmost action is the one a full swipe does.
+  const actionsFor = status => status === 'trashed' ? ['restore'] : status === 'archived' ? ['trash', 'restore'] : ['trash', 'archive'];
+  function swipeButtons(status) {
+    const list = actionsFor(status);
+    return '<div class="swipe-actions">' + list.map((a, k) => '<button class="swipe-btn ' + a + (k === list.length - 1 ? ' main' : '') +
+      '" data-act="' + a + '" tabindex="-1" aria-label="' + ACTION_LABEL[a] + '">' + ICON[a] + '<span>' + ACTION_LABEL[a] + '</span></button>').join('') + '</div>';
+  }
+  const SW = { open: null, drag: null, wheel: null, clickBlockUntil: 0 };
+  const ACTION_WIDTH = 78;
+  const openWidth = s => actionsFor(s.dataset.status).length * ACTION_WIDTH;
+  function place(s, x, animate) {
+    s.classList.toggle('dragging', !animate);
+    const width = s.offsetWidth;
+    s.classList.toggle('full', -x > width * 0.6);
+    $('.card', s).style.transform = x ? 'translateX(' + x + 'px)' : '';
+    $('.swipe-actions', s).style.width = Math.max(0, -x) + 'px';
+  }
+  function closeSwipe(s) {
+    if (!s) return;
+    place(s, 0, true);
+    s.classList.remove('full');
+    $$('.swipe-btn', s).forEach(b => { b.tabIndex = -1; });
+    if (SW.open === s) SW.open = null;
+  }
+  function openSwipe(s) {
+    if (SW.open && SW.open !== s) closeSwipe(SW.open);
+    place(s, -openWidth(s), true);
+    $$('.swipe-btn', s).forEach(b => { b.tabIndex = 0; });
+    SW.open = s;
+  }
+  // Where a drag lets go: past most of the card does the action on the right; past half the buttons, or a flick,
+  // leaves them open; anything less closes.
+  function settle(s, x, flick) {
+    if (-x > s.offsetWidth * 0.6) { const list = actionsFor(s.dataset.status); act(s, list[list.length - 1]); return; }
+    if (-x > openWidth(s) / 2 || flick) openSwipe(s); else closeSwipe(s);
+  }
+  const queueEl = $('#queue');
+  queueEl.addEventListener('pointerdown', e => {
+    const s = e.target.closest('.swipe');
+    if (SW.open && SW.open !== s) closeSwipe(SW.open);
+    if (!s || e.button > 0 || e.target.closest('.swipe-actions')) return;
+    SW.drag = { s, id: e.pointerId, x0: e.clientX, y0: e.clientY, base: SW.open === s ? -openWidth(s) : 0, dir: null, x: 0, t: e.timeStamp, vx: 0 };
+  });
+  window.addEventListener('pointermove', e => {
+    const d = SW.drag;
+    if (!d || e.pointerId !== d.id) return;
+    const dx = e.clientX - d.x0, dy = e.clientY - d.y0;
+    if (!d.dir) {
+      if (Math.hypot(dx, dy) < 8) return;
+      d.dir = Math.abs(dx) > Math.abs(dy) * 1.2 ? 'x' : 'y';
+      if (d.dir === 'y') { SW.drag = null; return; }   // a scroll, not a swipe
+      try { d.s.setPointerCapture(e.pointerId); } catch (err) { /* synthetic events */ }
+      const sel = window.getSelection();
+      if (sel) sel.removeAllRanges();
+    }
+    e.preventDefault();
+    let x = d.base + dx;
+    if (x > 0) x = x * 0.2;                               // nothing on the left side: it gives a little and comes back
+    const dt = Math.max(1, e.timeStamp - d.t);
+    d.vx = (x - d.x) / dt; d.x = x; d.t = e.timeStamp;
+    place(d.s, x, false);
+  }, { passive: false });
+  const endDrag = (e, cancelled) => {
+    const d = SW.drag;
+    if (!d || e.pointerId !== d.id) return;
+    SW.drag = null;
+    if (d.dir !== 'x') return;
+    SW.clickBlockUntil = Date.now() + 400;               // the drag was not a tap on the card
+    if (cancelled) { closeSwipe(d.s); return; }
+    settle(d.s, d.x, d.vx < -0.6);
+  };
+  window.addEventListener('pointerup', e => endDrag(e, false));
+  window.addEventListener('pointercancel', e => endDrag(e, true));
+  queueEl.addEventListener('dragstart', e => { if (e.target.closest('.swipe')) e.preventDefault(); });
+  queueEl.addEventListener('click', e => {
+    const b = e.target.closest('.swipe-btn');
+    if (b) { e.preventDefault(); e.stopPropagation(); act(b.closest('.swipe'), b.dataset.act); return; }
+    const s = e.target.closest('.swipe');
+    if (Date.now() < SW.clickBlockUntil || (s && SW.open === s)) {
+      e.preventDefault(); e.stopPropagation();
+      if (s && SW.open === s && Date.now() >= SW.clickBlockUntil) closeSwipe(s);   // a tap on an open card closes it
+    }
+  }, true);
+  window.addEventListener('scroll', () => { if (SW.open && !SW.drag) closeSwipe(SW.open); }, { passive: true });
+  // A tap anywhere else closes open actions, as in Mail.
+  document.addEventListener('pointerdown', e => { if (SW.open && !SW.open.contains(e.target)) closeSwipe(SW.open); }, true);
+  // A two-finger swipe on a trackpad.
+  queueEl.addEventListener('wheel', e => {
+    const s = e.target.closest('.swipe');
+    if (!s || Math.abs(e.deltaX) <= Math.abs(e.deltaY)) return;
+    e.preventDefault();
+    let w = SW.wheel;
+    if (!w || w.s !== s) {
+      if (SW.open && SW.open !== s) closeSwipe(SW.open);
+      w = SW.wheel = { s, x: SW.open === s ? -openWidth(s) : 0, timer: null };
+    }
+    w.x = Math.min(0, w.x - e.deltaX);
+    place(s, w.x, false);
+    clearTimeout(w.timer);
+    w.timer = setTimeout(() => { SW.wheel = null; settle(s, w.x, false); }, 160);
+  }, { passive: false });
+
+  async function act(s, what) {
+    const id = s.dataset.id, c = Q.cards.get(id);
+    const items = c && s.dataset.status === 'waiting' ? [c.item].concat(c.older) : [{ id, title: $('.card-title', s).textContent }];
+    const title = $('.card-title', s).textContent;
+    // Out of the list first, as Mail does, then tell the server.
+    s.classList.remove('dragging');
+    s.classList.add('full');
+    place(s, -s.offsetWidth, true);
+    s.style.height = s.offsetHeight + 'px';
+    requestAnimationFrame(() => requestAnimationFrame(() => { s.classList.add('leaving'); s.style.height = '0px'; s.style.marginTop = s.style.marginBottom = '0px'; s.style.opacity = '0'; }));
+    if (SW.open === s) SW.open = null;
+    const kind = what === 'archive' ? 'archived' : what === 'trash' ? 'trashed' : null;
+    const send = (i, put) => api('/api/items/' + i.id + '/done' + (put ? '' : '?closed_as=1'), put ? { method: 'POST', body: JSON.stringify({ closed_as: put }) } : { method: 'DELETE' });
+    try {
+      for (const i of items) await send(i, kind);
+    } catch (e) {
+      toast('Could not do that: ' + e.message, 5000);
+      showQueue();
+      return;
+    }
+    const was = s.dataset.status;
+    const n = items.length > 1 ? ' and ' + (items.length - 1) + ' older version' + (items.length > 2 ? 's' : '') : '';
+    showUndo((kind === 'archived' ? 'Archived' : kind === 'trashed' ? 'Moved to Trash' : 'Restored') + ': ' + title + n, async () => {
+      for (const i of items) {
+        if (kind) await send(i, null);                                        // back to where it was
+        else await send(i, was);                                              // back into Archived or Trash
+      }
+      showQueue();
+    });
+    setTimeout(() => { if (!$('#queue').hidden) showQueue(); }, 320);
+  }
+  let undoTimer = null, undoFn = null;
+  function showUndo(text, fn) {
+    undoFn = fn;
+    $('#undoText').textContent = text;
+    $('#undoBar').hidden = false;
+    clearTimeout(undoTimer);
+    undoTimer = setTimeout(() => { $('#undoBar').hidden = true; undoFn = null; }, 6000);
+  }
+  $('#undoBtn').addEventListener('click', async () => {
+    const fn = undoFn;
+    undoFn = null;
+    $('#undoBar').hidden = true;
+    clearTimeout(undoTimer);
+    if (!fn) return;
+    try { await fn(); toast('Undone'); } catch (e) { toast('Could not undo that: ' + e.message, 5000); showQueue(); }
+  });
 
   // ------------------------------------------------------------ versions of one document
 
-  const Q = { cards: new Map() };   // waiting card id -> {item, older}
+  const Q = { cards: new Map(), open: new Set() };   // waiting card id -> {item, older}; sections left open
+  $('#queue').addEventListener('toggle', e => {
+    const k = e.target.dataset && e.target.dataset.key;
+    if (k) { if (e.target.open) Q.open.add(k); else Q.open.delete(k); }
+  }, true);
   const marks = i => [i.count ? i.count + ' highlight' + (i.count === 1 ? '' : 's') : '',
     i.voice_notes ? i.voice_notes + ' voice note' + (i.voice_notes === 1 ? '' : 's') : '',
     i.edited ? 'your edits' : ''].filter(Boolean).join(', ');
@@ -1550,7 +1723,7 @@
     await flush();
     teardown();
     const token = S.loadToken;
-    $('#queue').hidden = true; $('#viewer').hidden = false;
+    $('#queue').hidden = true; $('#viewer').hidden = false; $('#undoBar').hidden = true;
     $('#tools').hidden = false; $('#back').hidden = false; $('#doneBtn').hidden = false; $('#refresh').hidden = true;
     $('#addBtn').hidden = true; $('#addPanel').hidden = true;
     setStatus('');
@@ -2305,6 +2478,9 @@
         ', closed ' + (i.superseded_auto ? 'automatically ' : '') + esc(fmtTime(i.superseded_at)) + '. Reopen puts it back in Waiting.');
     }
     if (i && i.kind === 'text' && i.status === 'done') lines.push('<b>Done</b> ' + esc(fmtTime(i.done_at)) + '. Reopen to edit it again.');
+    if (i && (i.status === 'archived' || i.status === 'trashed')) {
+      lines.push('<b>' + (i.status === 'archived' ? 'Archived' : 'In the Trash') + '</b> ' + esc(fmtTime(i.closed_at)) + '. Reopen puts it back in Waiting.');
+    }
     if (i && i.note) lines.push('<b>Note:</b> ' + esc(i.note));
     applyReadOnly();
     brief.hidden = !lines.length;

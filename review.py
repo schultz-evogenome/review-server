@@ -370,9 +370,11 @@ def summary(root, item):
         'pdf': req.get('pdf', ''), 'sha256': req.get('sha256', ''), 'source': req.get('source', ''),
         'kind': 'text' if req.get('text') else 'pdf', 'file': req.get('text') or req.get('pdf', ''),
         'edited': has_edits(item), 'doc': doc, 'version': version,
-        # "done" means the reviewer finished it; "superseded" means a newer version replaced it.
-        'status': 'waiting' if done is None else 'superseded' if replaced.get('superseded_by') else 'done',
-        'done_at': replaced.get('done_at'),
+        # "done" means the reviewer finished it; "superseded" means a newer version replaced it; "archived" and
+        # "trashed" mean the reviewer put it away, finished or not.
+        'status': 'waiting' if done is None else replaced['closed_as'] if replaced.get('closed_as') in PUT_AWAY
+        else 'superseded' if replaced.get('superseded_by') else 'done',
+        'done_at': replaced.get('done_at'), 'closed_at': replaced.get('closed_at'),
         'superseded_by': replaced.get('superseded_by'), 'superseded_version': replaced.get('superseded_version'),
         'superseded_at': replaced.get('superseded_at'), 'superseded_auto': bool(replaced.get('automatic')),
         'count': len(hs),
@@ -380,6 +382,40 @@ def summary(root, item):
         'discuss': sum(1 for h in hs if h.get('tag') == 'discuss'),
         'voice_notes': len(audio_files(item)),
     }
+
+
+PUT_AWAY = ('archived', 'trashed')
+
+
+def put_away(item, kind):
+    """Archive or trash an item: done.json says so, and what it was before, so that it can go back. No file is
+    deleted or moved."""
+    done = read_json(item / 'done.json', None)
+    if done is not None and not isinstance(done, dict):
+        done = {}
+    new = dict(done or {})
+    if not new.get('closed_as'):
+        new['closed_from'] = 'waiting' if done is None else 'superseded' if new.get('superseded_by') else 'done'
+    if done is None:
+        hs = load_highlights(item)['highlights']
+        new.update({'edited': has_edits(item), 'count': len(hs),
+                    'change': sum(1 for h in hs if h.get('tag') == 'change'),
+                    'discuss': sum(1 for h in hs if h.get('tag') == 'discuss')})
+    new.update({'closed_as': kind, 'closed_at': now()})
+    write_json(item / 'done.json', new)
+
+
+def take_back(item):
+    """Undo put_away: back to waiting, done, or superseded, as it was."""
+    done = read_json(item / 'done.json', None)
+    if not isinstance(done, dict) or not done.get('closed_as'):
+        return
+    if done.get('closed_from', 'waiting') == 'waiting':
+        (item / 'done.json').unlink()
+        return
+    for k in ('closed_as', 'closed_at', 'closed_from'):
+        done.pop(k, None)
+    write_json(item / 'done.json', done)
 
 
 def newest_versions(rows):
@@ -466,7 +502,11 @@ def format_review(s, highlights, path=None, texts=None, text=None):
     if s.get('note'):
         out.append('- Note to the reviewer: %s' % one(s['note']))
     out.append('- Queued %s%s.' % (s['queued_at'], (' by ' + s['queued_by']) if s['queued_by'] else ''))
-    if s['status'] == 'done':
+    if s['status'] == 'archived':
+        out.append('- Archived %s by the reviewer, who put it away%s.' % (s.get('closed_at'), '' if s.get('done_at') else ' without marking it done'))
+    elif s['status'] == 'trashed':
+        out.append('- Put in the trash %s by the reviewer%s. Nothing was deleted.' % (s.get('closed_at'), '' if s.get('done_at') else ', without marking it done'))
+    elif s['status'] == 'done':
         out.append('- Done %s.' % s['done_at'])
     elif s['status'] == 'superseded':
         out.append('- Superseded %s by %s (item %s), %s. The reviewer did not mark this one done.'
@@ -1132,11 +1172,19 @@ def make_handler(store, token):
                     return self.json_reply(400, {'error': str(e)})
                 return self.json_reply(200, {'images': images})
             try:
-                newer = self.body().get('superseded_by')
+                data = self.body()
             except ValueError:
-                newer = None                                 # a body that is not JSON just marks it done
+                data = {}                                    # a body that is not JSON just marks it done
+            data = data if isinstance(data, dict) else {}
+            newer = data.get('superseded_by')
             if newer:
                 return self.replace(root, item, parts[2], str(newer))
+            if data.get('closed_as') is not None:
+                if data['closed_as'] not in PUT_AWAY:
+                    return self.json_reply(400, {'error': 'closed_as must be "archived" or "trashed"'})
+                with store.item_lock(parts[2]):
+                    put_away(item, data['closed_as'])
+                return self.json_reply(200, {'item': summary(root, item)})
             with store.item_lock(parts[2]):
                 hs = load_highlights(item)['highlights']
                 write_json(item / 'done.json', {
@@ -1237,7 +1285,9 @@ def make_handler(store, token):
             if parts[3:] != ['done']:
                 return self.json_reply(404, {'error': 'not found'})
             with store.item_lock(parts[2]):
-                if (item / 'done.json').exists():
+                if 'closed_as' in self._query:              # take it out of Archived or Trash, back to where it was
+                    take_back(item)
+                elif (item / 'done.json').exists():
                     (item / 'done.json').unlink()
             self.json_reply(200, {'item': summary(root, item)})
 
