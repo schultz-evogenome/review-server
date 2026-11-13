@@ -54,11 +54,13 @@ installed for the Python that runs the server, each clip is turned into text in 
 (<clip>.json next to it); $REVIEW_WHISPER_MODEL picks the model (default small.en).
 """
 import argparse
+import base64
 import datetime as dt
 import difflib
 import hashlib
 import http.server
 import json
+import math
 import mimetypes
 import os
 import queue
@@ -466,7 +468,56 @@ def clean_highlights(raw):
                 anchor = None
             if anchor and min(anchor.values()) >= 0:
                 clean['anchor'] = anchor
+        if h.get('region') is not None:
+            if not re.fullmatch(r'[A-Za-z0-9_-]{1,40}', clean['id']):
+                raise ValueError('a figure mark needs a safe highlight id')
+            clean['region'] = clean_region(h['region'])
+            # A figure is anchored to a page or an image, never to nearby words.
+            clean.pop('anchor', None)
+            clean['rects'] = []
+            clean['page'] = clean['region'].get('page', 0)
         out.append(clean)
+    return out
+
+
+def clean_region(raw):
+    """A box in fractions of the page/image, from its top-left corner; independent of display size."""
+    if not isinstance(raw, dict):
+        raise ValueError('region must be an object')
+    box = {k: float(raw[k]) for k in ('x', 'y', 'w', 'h')}
+    if (not all(math.isfinite(v) and 0 <= v <= 1 for v in box.values())
+            or min(box['w'], box['h']) <= 0 or box['x'] + box['w'] > 1.000001
+            or box['y'] + box['h'] > 1.000001):
+        raise ValueError('figure box must be within its page or image')
+    if 'image' in raw and 'page' not in raw:
+        if not isinstance(raw['image'], str) or not raw['image'] or len(raw['image']) > 8192:
+            raise ValueError('figure mark needs an image reference')
+        box['image'] = raw['image']
+    elif 'page' in raw and 'image' not in raw:
+        page = int(raw['page'])
+        if page < 1 or page != raw['page']:
+            raise ValueError('figure mark needs a positive page number')
+        box['page'] = page
+    else:
+        raise ValueError('figure mark needs either a page or an image reference')
+    return box
+
+
+def region_images(raw, highlights):
+    """Decode crops sent with the highlights. Store them separately from the small annotation JSON."""
+    if not isinstance(raw, dict):
+        raise ValueError('region_images must be an object')
+    ids = {h['id'] for h in highlights if h.get('region')}
+    out = {}
+    for hid, encoded in raw.items():
+        if hid not in ids or not isinstance(encoded, str) or len(encoded) > 12 * 1024 * 1024:
+            raise ValueError('invalid figure snapshot')
+        data = base64.b64decode(encoded, validate=True)
+        if len(data) < 33 or data[:16] != b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR':
+            raise ValueError('figure snapshot must be a PNG')
+        if not all(0 < int.from_bytes(data[i:i + 4], 'big') <= 4096 for i in (16, 20)):
+            raise ValueError('figure snapshot is too large')
+        out[hid + '.png'] = data
     return out
 
 
@@ -488,7 +539,7 @@ def clock(seconds):
     return '%d:%02d' % (s // 60, s % 60)
 
 
-def format_review(s, highlights, path=None, texts=None, text=None):
+def format_review(s, highlights, path=None, texts=None, text=None, server=None):
     """One item as Markdown: its numbered highlights, with notes and transcribed voice notes, and for a
     text file the diff of the reviewer's edits."""
     one = lambda t: ' '.join(str(t).split())
@@ -526,11 +577,27 @@ def format_review(s, highlights, path=None, texts=None, text=None):
             out.append('- Line numbers count from 1 in %s.' % ('edited/' + text['name'] if text['edited'] else text['name']))
         out.append('')
     for h in hl:
-        if text is None:
+        region = h.get('region')
+        if region:
+            where = 'figure area in image %s' % one(region['image']) if 'image' in region else 'figure area on page %s' % region['page']
+        elif text is None:
             where = 'page %s' % h.get('page', '?')
         else:
             where = 'line %d' % (h['anchor']['line'] + 1) if h.get('anchor') else 'words since deleted'
-        out.append('%d. **%s**, %s: "%s"' % (h.get('n', 0), h.get('tag'), where, one(h.get('text', ''))))
+        out.append('%d. **%s**, %s%s' % (h.get('n', 0), h.get('tag'), where,
+                                       '' if region else ': "%s"' % one(h.get('text', ''))))
+        if region:
+            out.append('   Box from top-left: x %.2f%%, y %.2f%%, width %.2f%%, height %.2f%% of the %s.'
+                       % (*(100 * region[k] for k in ('x', 'y', 'w', 'h')), 'image' if 'image' in region else 'page'))
+            snapshot = region.get('snapshot')
+            if snapshot:
+                target = (str(Path(path) / 'regions' / snapshot) if path else
+                          '%s/api/items/%s/regions/%s' % (server.rstrip('/'), s['id'], snapshot) if server else
+                          'regions/' + snapshot)
+                out.append('   Marked area snapshot: %s' % target)
+                out.append('   Inspect this image with the note below; the box marks the visual content being discussed.')
+            else:
+                out.append('   No snapshot available; inspect this area in the original page or image.')
         if h.get('note'):
             out.append('   Note: %s' % one(h['note']))
         for k, c in enumerate(h.get('audio') or [], 1):
@@ -710,7 +777,7 @@ def cmd_pull(a):
     if a.json:
         print(json.dumps(d, indent=2, ensure_ascii=False))
     else:
-        print(format_review(d['item'], d['highlights']['highlights'], texts=d.get('transcripts'), text=d.get('text')))
+        print(format_review(d['item'], d['highlights']['highlights'], texts=d.get('transcripts'), text=d.get('text'), server=base))
 
 
 # ---------------------------------------------------------------- voice notes
@@ -1048,7 +1115,7 @@ def make_handler(store, token):
             if len(parts) == 3:
                 reply = {'item': summary(root, item), 'request': req,
                          'highlights': load_highlights(item), 'done': read_json(item / 'done.json'),
-                         'transcripts': transcripts(item), 'transcribe': store.transcriber.ok}
+                         'transcripts': transcripts(item), 'transcribe': store.transcriber.ok, 'figure_regions': True}
                 if req.get('text'):
                     reply['text'] = text_state(item, req)
                 return self.json_reply(200, reply)
@@ -1067,6 +1134,11 @@ def make_handler(store, token):
                 return self.send_file(p, IMAGE_TYPES[ext], {'Content-Security-Policy': 'sandbox; default-src \'none\'; '
                                                             'style-src \'unsafe-inline\'; img-src data:'}
                                       if ext == '.svg' else None)
+            if len(parts) == 5 and parts[3] == 'regions':
+                p = item / 'regions' / parts[4]
+                if not re.fullmatch(r'[A-Za-z0-9_-]{1,40}\.png', parts[4]) or not p.is_file():
+                    return self.json_reply(404, {'error': 'no such figure snapshot'})
+                return self.send_file(p, 'image/png')
             if parts[3:] == ['transcripts']:
                 return self.json_reply(200, {'transcripts': transcripts(item), 'transcribe': store.transcriber.ok})
             if len(parts) == 5 and parts[3] == 'audio':
@@ -1091,6 +1163,11 @@ def make_handler(store, token):
             try:
                 data = self.body()
                 highlights = clean_highlights(data.get('highlights'))
+                snapshots = region_images(data.get('region_images', {}), highlights)
+                req = read_json(item / 'request.json', {}) or {}
+                for h in highlights:
+                    if h.get('region') and bool(req.get('text')) != ('image' in h['region']):
+                        raise ValueError('figure target does not match this document type')
                 base = int(data.get('base_version', -1))
                 sent_max = int(data.get('max_n', 0))
             except (ValueError, KeyError, TypeError, AttributeError, OverflowError) as e:
@@ -1099,6 +1176,15 @@ def make_handler(store, token):
                 current = load_highlights(item)
                 if base != current['version']:
                     return self.json_reply(409, {'error': 'changed on another device', 'highlights': current})
+                if snapshots:
+                    (item / 'regions').mkdir(exist_ok=True)
+                    for name, body in snapshots.items():
+                        # A crop records what the reviewer saw at creation, even if the source changes later.
+                        if not (item / 'regions' / name).exists():
+                            write_bytes(item / 'regions' / name, body)
+                for h in highlights:
+                    if h.get('region') and (item / 'regions' / (h['id'] + '.png')).is_file():
+                        h['region']['snapshot'] = h['id'] + '.png'
                 max_n = max([sent_max, current['max_n']] + [h['n'] for h in highlights])
                 new = {'version': current['version'] + 1, 'updated_at': now(), 'max_n': max_n, 'highlights': highlights}
                 write_json(item / 'highlights.json', new)

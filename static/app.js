@@ -15,6 +15,9 @@
     pages: [],         // {n, div, text, over, scale}
     pdf: null,
     tool: 'select',
+    box: false,
+    regionsEnabled: false,
+    regionImages: new Map(),  // crops waiting to be saved with their figure marks
     finger: false,
     width: 0,
     dirty: false,
@@ -905,6 +908,7 @@
   function buildFigure(x) {
     const fig = document.createElement('figure');
     fig.className = 'cm-figure';
+    fig.dataset.ref = x.ref;
     const src = imageSrc(x.ref), cap = document.createElement('figcaption');
     cap.textContent = x.alt || refLabel(x.ref);
     if (!src) {
@@ -915,8 +919,11 @@
       b.addEventListener('click', () => { T.addRef = x.ref; $('#imageFile').click(); });
       cap.appendChild(b);
     } else {
+      const surface = document.createElement('span');
+      surface.className = 'figure-surface';
       const a = document.createElement('a');
       a.href = src; a.target = '_blank'; a.rel = 'noopener noreferrer';
+      a.draggable = false;
       if (/\.pdf$/i.test(T.images[x.ref] || '')) {
         const c = document.createElement('canvas');
         a.appendChild(c);
@@ -924,15 +931,20 @@
       } else {
         const img = document.createElement('img');
         img.alt = x.alt; img.src = src;
+        img.draggable = false;
         img.addEventListener('load', () => {
           if (fig.widget) fig.widget.changed();
           if (T.cm && !T.placing && window.reviewVim) window.reviewVim.keepCursorInView(T.cm);
         });
         a.appendChild(img);
       }
-      fig.appendChild(a);
+      surface.appendChild(a);
+      const over = document.createElement('span'); over.className = 'overlay';
+      surface.appendChild(over);
+      fig.appendChild(surface);
     }
     fig.appendChild(cap);
+    drawFigureRegions(fig);
     return fig;
   }
 
@@ -976,6 +988,7 @@
     b.hidden = !found.length;
     b.textContent = 'Images (' + found.length + ')';
     if (!$('#imagesPanel').hidden) renderImagesPanel();
+    drawAllFigureRegions();
   }
 
   function renderImagesPanel() {
@@ -1143,6 +1156,7 @@
       if (!PV.figures.has(key)) PV.figures.set(key, buildFigure({ ref, alt }));
       el.replaceWith(PV.figures.get(key));
     });
+    drawAllFigureRegions();
     box.scrollTop = top;
     watchPanes();
     if (edited) PV.driver = 'editor';
@@ -1289,6 +1303,7 @@
   const fromOf = a => ({ line: a.line, ch: a.ch }), toOf = a => ({ line: a.end_line, ch: a.end_ch });
 
   function placeOf(h) {
+    if (h.region) return h.region.image ? 'figure: ' + refLabel(h.region.image) : 'figure on page ' + h.region.page;
     if (h.rects && h.rects.length) return 'page ' + h.page;
     return h.anchor ? 'line ' + (h.anchor.line + 1) : 'its text is gone';
   }
@@ -1309,6 +1324,7 @@
   function anchorHighlights() {
     let changed = false;
     for (const h of S.hl) {
+      if (h.region) continue;
       const a = findWords(h);
       if (!sameAnchor(a, h.anchor)) { h.anchor = a; if (a) h.page = a.line + 1; changed = true; }
     }
@@ -1391,6 +1407,7 @@
     $('#editor').classList.toggle('drawing', tool !== 'edit');
     $('#preview').classList.toggle('drawing', tool !== 'edit');
     applyReadOnly();
+    if (tool === 'edit') setBox(false);
     if (tool !== 'edit') {
       $('#selbar').hidden = true;
       if (T.cm && T.cm.somethingSelected()) T.cm.setCursor(T.cm.getCursor());
@@ -1449,7 +1466,7 @@
     const badge = e.target.closest && e.target.closest('#hlBadges .badge');
     TX.tap = { x: e.clientX, y: e.clientY, t: Date.now(), n: badge ? Number(badge.dataset.n) : null };
     if (badge) { e.stopPropagation(); return; }
-    if (S.textTool === 'edit' || e.button > 0 || e.pointerType === 'touch' || (e.target.closest && e.target.closest('.cm-figure'))) return;
+    if (S.textTool === 'edit' || S.box || e.button > 0 || e.pointerType === 'touch' || (e.target.closest && e.target.closest('.cm-figure'))) return;
     e.preventDefault(); e.stopPropagation();
     try { editorEl.setPointerCapture(e.pointerId); } catch (err) { /* synthetic events */ }
     TX.stroke = { id: e.pointerId, x0: e.clientX, y0: e.clientY, tag: S.textTool, moved: false };
@@ -1642,7 +1659,7 @@
     return pointAt(e.clientX, s && Math.abs(e.clientY - s.y0) < 0.7 * row ? s.y0 : e.clientY);
   };
   previewEl.addEventListener('pointerdown', e => {
-    if (!T.cm || !PV.on || S.textTool === 'edit' || e.button > 0) return;
+    if (!T.cm || !PV.on || S.textTool === 'edit' || S.box || e.button > 0 || e.target.closest('.cm-figure')) return;
     TX.tap = { x: e.clientX, y: e.clientY, t: Date.now(), n: null };
     if (e.pointerType === 'touch') return;
     e.preventDefault();
@@ -1712,6 +1729,8 @@
 
   function teardown() {
     S.loadToken++;
+    cancelRegion();
+    S.regionImages.clear();
     closeText();
     if (S.pdf) { try { S.pdf.destroy(); } catch (e) { /* ignore */ } }
     S.pdf = null; S.pages = []; S.openN = null; S.lastRange = null;
@@ -1733,6 +1752,8 @@
     catch (e) { toast('Could not open it: ' + e.message, 5000); location.hash = '#/'; return; }
     if (token !== S.loadToken) return;
     S.item = data.item;
+    S.regionsEnabled = !!data.figure_regions;
+    $$('[data-box]').forEach(b => { b.hidden = !S.regionsEnabled; });
     S.version = data.highlights.version;
     S.hl = data.highlights.highlights || [];
     S.deleted = new Set();
@@ -1802,6 +1823,10 @@
     P.over.innerHTML = '';
     const placed = [];
     for (const h of S.hl) {
+      if (h.region) {
+        if (h.region.page === P.n) P.over.appendChild(regionBox(h));
+        continue;
+      }
       const rs = (h.rects || []).filter(r => r.page === P.n);
       if (!rs.length) continue;
       for (const r of rs) {
@@ -1827,6 +1852,7 @@
   function redrawAll() {
     S.pages.forEach(drawHighlights);
     if (T.cm) redrawTextHighlights();
+    drawAllFigureRegions();
     if (!$('#list').hidden) renderList();
   }
 
@@ -1842,6 +1868,173 @@
     }
   }
   const clearPreview = () => $$('.hl.preview').forEach(d => d.remove());
+
+  // ------------------------------------------------------------ figure areas
+
+  // Boxes use fractions of the complete page/image, so they survive zooming, reflow, and another device.
+  // A crop records the visual content at creation; notes and audio belong to the same numbered highlight.
+  let regionStroke = null, regionTap = null, regionClickUntil = 0;
+  function setBox(on) {
+    S.box = on;
+    $$('[data-box]').forEach(b => { b.classList.toggle('on', on); b.setAttribute('aria-pressed', String(on)); });
+    if (on) {
+      if (T.cm && S.textTool === 'edit') setTextTool('change');
+      else if (!T.cm && S.tool === 'select') setTool('change');
+      toast('Drag a box around the area, then add a note or recording.');
+    }
+    cancelRegion();
+  }
+  $$('[data-box]').forEach(b => b.addEventListener('click', () => setBox(!S.box)));
+
+  function regionBox(h, trial) {
+    const r = h.region, box = document.createElement('div');
+    box.className = 'region-box ' + h.tag + (trial ? ' trial' : '') + (S.openN === h.n ? ' open' : '');
+    box.style.cssText = 'left:' + r.x * 100 + '%;top:' + r.y * 100 + '%;width:' + r.w * 100 + '%;height:' + r.h * 100 + '%';
+    if (!trial) {
+      box.dataset.n = String(h.n);
+      const b = document.createElement('span');
+      b.className = 'badge ' + h.tag + (h.note ? ' noted' : '') + (h.audio && h.audio.length ? ' voiced' : '');
+      b.textContent = h.n; b.dataset.n = String(h.n);
+      box.appendChild(b);
+    }
+    return box;
+  }
+  function drawFigureRegions(fig) {
+    const over = $('.overlay', fig);
+    if (!over) return;
+    over.innerHTML = '';
+    for (const h of S.hl) if (h.region && h.region.image === fig.dataset.ref) over.appendChild(regionBox(h));
+  }
+  function drawAllFigureRegions() {
+    $$('.cm-figure').forEach(drawFigureRegions);
+  }
+  function regionTarget(el) {
+    const surface = el.closest('.figure-surface');
+    if (surface) return { surface, over: $('.overlay', surface), source: $('img, canvas', surface), image: surface.closest('.cm-figure').dataset.ref };
+    const page = el.closest('.page');
+    if (page) return { surface: page, over: $('.overlay', page), source: $('canvas', page), page: Number(page.dataset.page) };
+    return null;
+  }
+  function regionPoint(target, e) {
+    const b = target.surface.getBoundingClientRect(), clamp = v => Math.max(0, Math.min(1, v));
+    return { x: clamp((e.clientX - b.left) / b.width), y: clamp((e.clientY - b.top) / b.height) };
+  }
+  function regionBounds(s, e) {
+    const p = regionPoint(s.target, e);
+    return { x: Math.min(s.start.x, p.x), y: Math.min(s.start.y, p.y), w: Math.abs(p.x - s.start.x), h: Math.abs(p.y - s.start.y),
+      ...(s.target.image ? { image: s.target.image } : { page: s.target.page }) };
+  }
+  function regionHit(target, e) {
+    const p = regionPoint(target, e);
+    const badge = $$('.region-box .badge', target.over).find(b => {
+      const r = b.getBoundingClientRect();
+      return e.clientX >= r.left - 4 && e.clientX <= r.right + 4 && e.clientY >= r.top - 4 && e.clientY <= r.bottom + 4;
+    });
+    if (badge) return S.hl.find(h => String(h.n) === badge.dataset.n);
+    return S.hl.slice().reverse().find(h => {
+      const r = h.region;
+      return r && (target.image ? r.image === target.image : r.page === target.page) &&
+        p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h;
+    });
+  }
+  function cancelRegion() {
+    if (regionStroke) {
+      const { target, id } = regionStroke;
+      if (target.surface.hasPointerCapture(id)) target.surface.releasePointerCapture(id);
+    }
+    regionStroke = null; regionTap = null;
+    $$('.region-box.trial').forEach(b => b.remove());
+  }
+  document.addEventListener('pointerdown', e => {
+    if (!S.item || !S.regionsEnabled || e.button > 0 || regionStroke) return;
+    const target = regionTarget(e.target);
+    if (!target || !target.source || !target.source.width) return;
+    const tag = T.cm ? S.textTool : S.tool, pen = tag === 'change' || tag === 'discuss';
+    const box = pen && (S.box || target.image), hit = regionHit(target, e);
+    if (!box && !hit) return;
+    // A finger may tap a mark, but still scrolls unless the PDF's Finger draws control is checked.
+    regionTap = { target, id: e.pointerId, x: e.clientX, y: e.clientY };
+    e.stopPropagation();
+    if (!box || (e.pointerType === 'touch' && (T.cm || !S.finger))) return;
+    e.preventDefault();
+    if (S.reopen) { toast('Reopen it to mark a figure'); return; }
+    const b = target.surface.getBoundingClientRect();
+    if (!b.width || !b.height) return;
+    regionStroke = { target, id: e.pointerId, x: e.clientX, y: e.clientY, start: regionPoint(target, e), tag };
+    try { target.surface.setPointerCapture(e.pointerId); } catch (err) { /* synthetic events */ }
+  }, true);
+  document.addEventListener('pointermove', e => {
+    const s = regionStroke;
+    if (!s || e.pointerId !== s.id) return;
+    e.preventDefault(); e.stopPropagation();
+    $$('.region-box.trial', s.target.over).forEach(b => b.remove());
+    s.target.over.appendChild(regionBox({ region: regionBounds(s, e), tag: s.tag }, true));
+  }, true);
+  document.addEventListener('pointerup', e => {
+    const s = regionStroke, t = regionTap;
+    if (!t || e.pointerId !== t.id) return;
+    e.stopPropagation();
+    const r = s && regionBounds(s, e), b = t.target.surface.getBoundingClientRect();
+    cancelRegion();
+    regionClickUntil = Date.now() + 600;
+    if (s && r.w * b.width >= 6 && r.h * b.height >= 6) {
+      e.preventDefault(); addRegion(r, s.tag, s.target); return;
+    }
+    if (Math.hypot(e.clientX - t.x, e.clientY - t.y) < 8) {
+      const h = regionHit(t.target, e);
+      if (h) openSheet(h.n);
+    }
+  }, true);
+  document.addEventListener('pointercancel', e => {
+    if (regionTap && e.pointerId === regionTap.id) cancelRegion();
+  }, true);
+  document.addEventListener('click', e => {
+    if (Date.now() < regionClickUntil && e.target.closest('.figure-surface, .page')) { e.preventDefault(); e.stopPropagation(); }
+  }, true);
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') cancelRegion(); });
+
+  function regionCrop(region, source) {
+    const sw = source.naturalWidth || source.width, sh = source.naturalHeight || source.height;
+    if (!sw || !sh) throw new Error('image has not loaded');
+    // Some surrounding context helps an agent locate a panel or label; the red outline gives the precise box.
+    const pad = 0.035, x = Math.max(0, region.x - pad), y = Math.max(0, region.y - pad);
+    const w = Math.min(1, region.x + region.w + pad) - x, h = Math.min(1, region.y + region.h + pad) - y;
+    const scale = Math.min(1, 1400 / Math.max(w * sw, h * sh));
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(w * sw * scale)); canvas.height = Math.max(1, Math.round(h * sh * scale));
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(source, x * sw, y * sh, w * sw, h * sh, 0, 0, canvas.width, canvas.height);
+    const rx = (region.x - x) / w * canvas.width, ry = (region.y - y) / h * canvas.height;
+    const rw = region.w / w * canvas.width, rh = region.h / h * canvas.height;
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 4; ctx.strokeRect(rx, ry, rw, rh);
+    ctx.strokeStyle = '#d1242f'; ctx.lineWidth = 2; ctx.strokeRect(rx, ry, rw, rh);
+    return canvas.toDataURL('image/png').split(',')[1];
+  }
+  function addRegion(region, tag, target) {
+    if (S.reopen) return;
+    const t = isoLocal();
+    S.maxN = Math.max(S.maxN, ...S.hl.map(h => h.n || 0)) + 1;
+    const h = { n: S.maxN, id: newId(), tag, page: region.page || 0, text: '', note: '', rects: [], region, created_at: t, updated_at: t };
+    try {
+      S.regionImages.set(h.id, regionCrop(region, target.source));
+      region.snapshot = h.id + '.png';
+    } catch (e) {
+      toast('Area marked. A close-up could not be saved for this image; its location will still be saved.', 6000);
+    }
+    S.hl.push(h);
+    redrawAll(); scheduleSave();
+    showBar('#' + h.n + ' ' + tag + ': figure area', { type: 'add', id: h.id }, true);
+  }
+  function regionSnapshot(h) {
+    return S.regionImages.has(h.id) ? 'data:image/png;base64,' + S.regionImages.get(h.id)
+      : '/api/items/' + S.item.id + '/regions/' + encodeURIComponent(h.region.snapshot);
+  }
+  function highlightPayload() {
+    const images = {};
+    for (const h of S.hl) if (h.region && S.regionImages.has(h.id)) images[h.id] = S.regionImages.get(h.id);
+    return { base_version: S.version, max_n: S.maxN, highlights: S.hl, region_images: images };
+  }
 
   // ------------------------------------------------------------ geometry
 
@@ -2125,6 +2318,7 @@
     S.tool = tool;
     $$('[data-tool]').forEach(b => b.classList.toggle('on', b.dataset.tool === tool));
     pagesEl.classList.toggle('drawing', tool !== 'select');
+    if (tool === 'select') setBox(false);
     if (tool !== 'select') { const sel = window.getSelection(); if (sel) sel.removeAllRanges(); $('#selbar').hidden = true; }
   }
   $('#finger').addEventListener('change', e => {
@@ -2143,7 +2337,11 @@
     $('#sheetNum').textContent = '#' + h.n;
     $('#sheetPage').textContent = placeOf(h);
     const q = $('#sheetQuote');
-    q.textContent = h.text; q.className = h.tag;
+    q.textContent = h.region ? 'Marked figure area' : h.text; q.className = h.tag;
+    const picture = $('#sheetRegion');
+    picture.hidden = !h.region || !h.region.snapshot;
+    if (!picture.hidden) picture.src = regionSnapshot(h);
+    else picture.removeAttribute('src');
     $$('[data-settag]').forEach(b => b.classList.toggle('on', b.dataset.settag === h.tag));
     $('#sheetNote').value = h.note || '';
     $('#sheet').hidden = false; $('#selbar').hidden = true; $('#lastbar').hidden = true;
@@ -2376,15 +2574,23 @@
       '<span class="muted">' + counts.change + ' change, ' + counts.discuss + ' discuss</span>' +
       '<button id="listClose">Close</button></div>' +
       (items.length ? items.map(h => '<div class="li" data-n="' + h.n + '"><span class="badge ' + h.tag + (h.note ? ' noted' : '') + (h.audio && h.audio.length ? ' voiced' : '') + '">' + h.n + '</span><div>' +
-        '<div class="li-text">' + esc(h.text.length > 220 ? h.text.slice(0, 220) + '…' : h.text) + '</div>' +
+        '<div class="li-text">' + (h.region ? 'Marked figure area' : esc(h.text.length > 220 ? h.text.slice(0, 220) + '…' : h.text)) + '</div>' +
         (h.note ? '<div class="li-note">' + esc(h.note) + '</div>' : '') +
         (h.audio || []).map((c, k) => '<div class="li-voice">Voice note ' + (k + 1) + ' (' + clockStr(c.seconds) + '): ' + clipStatus(c.file) + '</div>').join('') +
-        '<div class="li-meta">' + placeOf(h) + ' &middot; ' + h.tag + '</div></div></div>').join('')
+        '<div class="li-meta">' + esc(placeOf(h)) + ' &middot; ' + h.tag + '</div></div></div>').join('')
         : '<p class="muted">No highlights yet.</p>');
     $('#listClose').addEventListener('click', () => { L.hidden = true; });
     $$('.li', L).forEach(el => el.addEventListener('click', () => {
       const h = S.hl.find(x => String(x.n) === el.dataset.n);
       if (!h) return;
+      if (h.region) {
+        const target = h.region.image ? $$('.cm-figure', PV.on ? previewEl : editorEl).find(f => f.dataset.ref === h.region.image)
+          : (S.pages[h.region.page - 1] || {}).div;
+        if (target) {
+          const box = $$('.region-box', target).find(b => b.dataset.n === String(h.n));
+          (box || target).scrollIntoView({ block: 'center', behavior: 'smooth' });
+        }
+      }
       if (T.cm && h.anchor) {
         const y = T.cm.charCoords(fromOf(h.anchor), 'page').top - $('#bar').offsetHeight - 80;
         window.scrollTo({ top: Math.max(0, y), behavior: 'smooth' });
@@ -2412,9 +2618,13 @@
     if (S.saving) { scheduleSave(400); return; }
     S.saving = true; S.dirty = false; setStatus('Saving…');
     const id = S.item.id;
+    const payload = highlightPayload();
     try {
-      const r = await api('/api/items/' + id + '/highlights', { method: 'PUT', body: JSON.stringify({ base_version: S.version, max_n: S.maxN, highlights: S.hl }) });
-      if (S.item && S.item.id === id) { S.version = r.highlights.version; S.item = r.item; }
+      const r = await api('/api/items/' + id + '/highlights', { method: 'PUT', body: JSON.stringify(payload) });
+      if (S.item && S.item.id === id) {
+        S.version = r.highlights.version; S.item = r.item;
+        Object.keys(payload.region_images).forEach(hid => S.regionImages.delete(hid));
+      }
       setStatus(S.dirty ? 'Not saved yet' : 'Saved');
     } catch (e) {
       S.dirty = true;
@@ -2452,7 +2662,7 @@
     if (S.dirty && S.item) {
       fetch('/api/items/' + S.item.id + '/highlights', {
         method: 'PUT', keepalive: true, credentials: 'same-origin', headers: { 'Content-Type': 'application/json', 'X-Review': '1' },
-        body: JSON.stringify({ base_version: S.version, max_n: S.maxN, highlights: S.hl }),
+        body: JSON.stringify(highlightPayload()),
       }).catch(() => {});
     }
     if (T.cm && T.dirty && !T.conflict && S.item) {

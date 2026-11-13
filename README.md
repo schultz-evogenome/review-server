@@ -71,6 +71,7 @@ The server then loads the speech model when the first clip arrives, keeps it in 
 - **Older versions.** If older versions of a document are still waiting, its card says so ("2 older versions"). Tap that line to list them; each still opens. **Mark older done** closes them. If any of them has your highlights or voice notes, the card lists those and asks first. Closed versions go to Replaced, labeled with the version that replaced them, not to Done.
 - **Select** (the default). Touch and hold to select text, drag the handles, then tap Change or Discuss at the bottom of the screen.
 - **Change pen** and **Discuss pen.** Draw over text with the Pencil. Your finger still scrolls. Without a Pencil, turn on Finger draws, and turn it off again to scroll.
+- **Figure areas.** Choose Change pen or Discuss pen, turn on **Box**, and drag diagonally around the part of a figure you mean. It works anywhere on a PDF, including scanned pages with no selectable text. The box gets a number and the same Add note, Record, Undo, and tag controls as a text highlight. Tap inside it or on its number to return to the notes. Turn Box off to highlight words again. Boxes stay aligned when the page changes size; each saves a close-up with the exact area outlined in red for agents to inspect.
 - **Numbers.** Each highlight gets a number in the left margin, in the order you make them. Numbers are never reused, so you can say "4, cut it" when you talk through the review.
 - **Notes.** Tap a highlight or its number to change its tag, add a note (the microphone key on the keyboard dictates), or delete it. Right after you make a highlight, "Add note," "Record," and "Undo" appear for a few seconds.
 - **Voice notes.** Tap Record in a highlight's panel (or right after making the highlight), talk, and tap Stop. The clip is saved with that highlight, where you can play it back or delete it (two taps), and its text appears under it a few seconds later. Safari asks for the microphone the first time. The number in the margin shows ✎ for a note and ♪ for a voice note.
@@ -101,6 +102,8 @@ The iPad keyboard's dictation works as in any text box.
 **Highlights and voice notes.** Besides editing, you can mark up a text file as you would a PDF. Choose **Change pen** or **Discuss pen**, then draw across words with an Apple Pencil (or a mouse): the whole words it crosses are highlighted, and nothing is written by hand. Fingers still scroll. Right after a highlight, tap **Record** to leave a voice note; later, tap its number in the margin, or the highlight itself while a pen is chosen, to open its panel. **List** shows them all. With **Edit** chosen, select text with a finger, a mouse, or visual mode and tap Change or Discuss. While a pen is chosen the editor takes no typing, so the keyboard stays away. On a touch screen a file opens with a pen chosen, and each device remembers your choice.
 
 Highlights move with the text as you edit it. If you delete all of a highlight's words it stays in the list, with its voice notes, marked as gone. If the text is replaced (Revert, or using another device's version), each highlight finds its words again nearby, if they are still there. In a Markdown file's Preview you can do the same: draw across the rendered words, tap a highlight to open it, or with **Edit** chosen select text and tap Change or Discuss. The highlight lands on those words in the source, on both sides.
+
+**Figures in text files.** With either pen chosen, drag across an image to box an area of it; this works both in the editor and in Markdown Preview, including the first page of an embedded PDF figure. The box is attached to that image reference, so adding or removing paragraphs above it does not move the mark. The same image shown in both panes shows the same boxes. Choose Edit to open an image by itself as before. A figure removed from the text keeps its marks, notes, and saved close-ups in List. Images loaded from another website may prevent a close-up from being saved; in that case the box location is still kept and the page tells you.
 
 ## Versions
 
@@ -159,6 +162,7 @@ Then:
 
 - Pair each thing the reviewer says with a highlight by the number they say, by the words they read aloud from it, or by order. Voice notes are the reviewer's comments on that highlight, in their words.
 - "Change" highlights mark text they want changed. "Discuss" highlights mark things to raise with them; they are not edits to make on your own.
+- A **figure area** points to visual content, not surrounding text. `show` and `pull` give the PDF page or the exact image reference, the box position, and the saved close-up's local path or server URL. Open that image and read its notes/transcript together before modifying the figure. Coordinates are fractions of the complete page or image from the top-left, displayed as percentages in the report. The red outline in the close-up marks the exact selected area; a small margin supplies context. The close-up records what was visible when marked, so check the source if the image has since changed. If no close-up is available, inspect the box in the original page or image.
 - Highlights belong to the copy in the item folder. If the draft has changed since it was queued (compare `sha256` in `request.json`), say so before applying anything. On a text file they follow the reviewer's edits: their line numbers are in `edited/<name>` if it exists, and `show` and `pull` print the highlights first and then the diff.
 - Do not edit `highlights.json` or `done.json`; the server writes them.
 
@@ -179,9 +183,14 @@ Without the script, send an image a text file refers to with `curl -X POST -H 'X
     audio/            voice notes (<highlight id>_<time>.m4a or .webm) and their text (<clip>.json)
     edited/<name>     a text file with the reviewer's edits; gone again if they undo every edit
     images/           the images a text file refers to
+    regions/          PNG close-ups for figure marks (<highlight id>.png), with the selected area outlined
 ```
 
 Each highlight has `n` (its number), `tag` ("change" or "discuss"), `page`, `text`, `note`, `rects` (page, x, y, width, and height in PDF points from the top-left corner of the page), `audio` (its voice notes: file, seconds), and `created_at` and `updated_at`.
+
+A figure mark also has `region`: `{x, y, w, h, page}` for a PDF, or `{x, y, w, h, image}` for an image reference in a text file. These coordinates are fractions from 0 to 1, independent of screen size; `text` and `rects` are empty, and there is no text `anchor`. When a close-up was saved, `region.snapshot` is its filename under `regions/`, also available from `/api/items/<id>/regions/<filename>`. Crops are saved with the highlights in the same version-checked request. Deleting and undoing a mark preserves its crop.
+
+To check the server, run `python3 -m unittest -q test_review`. Figure interaction checks use a temporary server and headless Chrome: `node tools/test-regions.mjs` (Node 22+ and Chrome, no npm packages). `CHROME` and `PYTHON` can select the executables. These checks use temporary documents and leave the real queue alone.
 
 ## Notes
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Tests for versions and replaced items: python3 -m unittest -v test_review (standard library only)."""
 import contextlib
+import base64
 import http.server
 import io
 import json
@@ -596,6 +597,107 @@ class TextFiles(Base):
         with urllib.request.urlopen(self.base + '/api/items/%s/images/001_b.svg' % iid) as r:
             self.assertIn('sandbox', r.headers['Content-Security-Policy'])
             self.assertEqual(r.headers['Content-Type'], 'image/svg+xml')
+
+
+class FigureRegions(Base):
+    png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a6XcAAAAASUVORK5CYII='
+
+    def mark(self, **target):
+        return {'id': 'figure1', 'n': 1, 'tag': 'change', 'text': '', 'note': 'Enlarge the axis label',
+                'region': dict(x=0.2, y=0.3, w=0.25, h=0.1, **(target or {'page': 1})),
+                'audio': [{'file': 'figure1_note.m4a', 'seconds': 3.5}]}
+
+    def save(self, iid, marks, base=0, images=None):
+        return self.call('PUT', '/api/items/%s/highlights' % iid,
+                         {'base_version': base, 'highlights': marks, 'region_images': images or {}})
+
+    def test_pdf_box_snapshot_notes_and_agent_output(self):
+        iid, folder = self.queue('Figure_v1.pdf')
+        code, result = self.save(iid, [self.mark()], images={'figure1': self.png})
+        self.assertEqual(code, 200)
+        h = result['highlights']['highlights'][0]
+        self.assertEqual((h['region']['page'], h['region']['snapshot'], h['rects'], h['text']), (1, 'figure1.png', [], ''))
+        self.assertEqual(h['audio'][0]['file'], 'figure1_note.m4a')
+        self.assertEqual((result['item']['count'], result['item']['change']), (1, 1))
+        snapshot = folder / 'regions' / 'figure1.png'
+        self.assertEqual(snapshot.read_bytes(), base64.b64decode(self.png))
+        with urllib.request.urlopen(self.base + '/api/items/%s/regions/figure1.png' % iid) as r:
+            self.assertEqual((r.headers['Content-Type'], r.read()), ('image/png', snapshot.read_bytes()))
+        # Subsequent ordinary saves retain the crop; the payload itself is not in highlights.json.
+        h['tag'] = 'discuss'
+        code, result = self.save(iid, [h], base=1)
+        self.assertEqual((code, result['highlights']['highlights'][0]['region']['snapshot']), (200, 'figure1.png'))
+        self.assertNotIn(self.png, (folder / 'highlights.json').read_text())
+        (folder / 'audio').mkdir()
+        (folder / 'audio' / 'figure1_note.m4a').write_bytes(b'audio')
+        review.write_json(folder / 'audio' / 'figure1_note.m4a.json', {'text': 'Make this label bigger.'})
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            review.main(['show', str(folder), '--root', str(self.tmp / 'repo')])
+        for phrase in ('figure area on page 1', 'x 20.00%', str(snapshot), 'Make this label bigger.', 'Enlarge the axis label'):
+            self.assertIn(phrase, out.getvalue())
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            review.main(['pull', iid, '--server', self.base])
+        self.assertIn(self.base + '/api/items/%s/regions/figure1.png' % iid, out.getvalue())
+        self.queue('Figure_v2.pdf')
+        self.assertEqual(self.store.sweep(), [])  # A boxed figure is reviewed content, even with no selected text.
+
+    def test_image_box_survives_text_edits_and_server_restart(self):
+        folder = review.make_item(self.repo, 'Notes_v1.md', b'![Plot](plot.png)\n', {})
+        iid = review.item_id(folder)
+        code, result = self.save(iid, [self.mark(image='plot.png')], images={'figure1': self.png})
+        self.assertEqual(code, 200)
+        text = self.call('GET', '/api/items/' + iid)[1]['text']
+        self.assertEqual(self.call('PUT', '/api/items/%s/text' % iid,
+                                  {'text': 'New paragraph\n\n![Plot](plot.png)\n', 'base_sha256': text['sha256']})[0], 200)
+        self.stop()
+        self.start()
+        detail = self.call('GET', '/api/items/' + iid)[1]
+        h = detail['highlights']['highlights'][0]
+        self.assertEqual(h['region']['image'], 'plot.png')
+        self.assertNotIn('anchor', h)
+        output = review.format_review(detail['item'], [h], text=detail['text'])
+        self.assertIn('figure area in image plot.png', output)
+        self.assertNotIn('words since deleted', output)
+
+    def test_stale_save_does_not_write_crops_and_undo_preserves_them(self):
+        iid, folder = self.queue('Figure_v1.pdf')
+        self.assertEqual(self.save(iid, [self.mark()])[0], 200)
+        code, result = self.save(iid, [self.mark()], images={'figure1': self.png})
+        self.assertEqual(code, 409)
+        self.assertFalse((folder / 'regions').exists())
+        self.assertEqual(self.save(iid, [self.mark()], base=1, images={'figure1': self.png})[0], 200)
+        self.assertEqual(self.save(iid, [], base=2)[0], 200)
+        code, result = self.save(iid, [self.mark()], base=3)
+        self.assertEqual(result['highlights']['highlights'][0]['region']['snapshot'], 'figure1.png')
+
+    def test_invalid_regions_and_snapshots_are_rejected_without_writes(self):
+        iid, folder = self.queue('Figure_v1.pdf')
+        bad = []
+        for field, value in [('x', -0.1), ('w', 0), ('w', 2), ('h', float('nan')), ('y', float('inf')),
+                             ('page', 0), ('page', 1.5), ('image', 'also an image')]:
+            h = self.mark()
+            h['region'][field] = value
+            bad.append(h)
+        for value in (None, 'box', [], {}):
+            h = self.mark()
+            if value is None:
+                h['region'].pop('x')
+            else:
+                h['region'] = value
+            bad.append(h)
+        h = self.mark()
+        h['id'] = '../escape'
+        bad.append(h)
+        bad.append(self.mark(image='plot.png'))  # An image target cannot be attached to a PDF item.
+        for h in bad:
+            with self.subTest(mark=h):
+                self.assertEqual(self.save(iid, [h])[0], 400)
+        for snapshots in ({'figure1': 'garbage'}, {'figure1': base64.b64encode(b'not a PNG').decode()}, {'../escape': self.png}):
+            self.assertEqual(self.save(iid, [self.mark()], images=snapshots)[0], 400)
+        self.assertFalse((folder / 'highlights.json').exists())
+        self.assertFalse((folder / 'regions').exists())
+        for name in ('..%2Frequest.json', 'missing.png'):
+            self.assertEqual(self.call('GET', '/api/items/%s/regions/%s' % (iid, name))[0], 404)
 
 
 class NoAutoClose(Base):

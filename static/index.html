@@ -30,6 +30,7 @@
       <button data-tool="change">Change pen</button>
       <button data-tool="discuss">Discuss pen</button>
     </span>
+    <button data-box hidden aria-pressed="false" title="Drag a box around part of a figure">Box</button>
     <label class="check"><input type="checkbox" id="finger"> Finger draws</label>
     <span class="spacer"></span>
     <button id="listBtn">List</button>
@@ -40,6 +41,7 @@
       <button data-ttool="change">Change pen</button>
       <button data-ttool="discuss">Discuss pen</button>
     </span>
+    <button data-box hidden aria-pressed="false" title="Drag a box around part of a figure">Box</button>
     <label class="check"><input type="checkbox" id="vimOn"> Vim keys</label>
     <span class="seg" role="group" aria-label="Text size">
       <button id="sizeDown" title="Smaller text" aria-label="Smaller text">A&minus;</button>
@@ -99,6 +101,7 @@
     <button id="sheetClose" class="primary">Close</button>
   </div>
   <blockquote id="sheetQuote"></blockquote>
+  <img id="sheetRegion" hidden alt="The marked figure area, outlined in red">
   <textarea id="sheetNote" rows="3" placeholder="Note (optional). Tap the microphone on the keyboard to dictate."></textarea>
   <div id="clips"></div>
 </section>
