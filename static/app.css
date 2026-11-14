@@ -192,6 +192,8 @@ button.discuss { background: var(--discuss-solid); border-color: var(--discuss-s
   padding: 14px 0;
   touch-action: manipulation;
 }
+#pages.zoomed { align-items: flex-start; width: max-content; min-width: 100%; padding-left: 8px; padding-right: 8px; box-sizing: border-box; }
+#pages { touch-action: pan-x pan-y; transform-origin: 0 0; }
 #pages.drawing.finger { touch-action: none; }
 #pages.drawing .textLayer { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
 .page { position: relative; background: #fff; box-shadow: 0 1px 5px rgba(0, 0, 0, 0.22); }

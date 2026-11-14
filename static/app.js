@@ -1766,6 +1766,7 @@
     try { S.pdf = await pdfjsLib.getDocument({ url: '/api/items/' + id + '/file', withCredentials: true }).promise; }
     catch (e) { $('#pages').innerHTML = '<div class="loading error">Could not load the PDF: ' + esc(e.message) + '</div>'; return; }
     if (token !== S.loadToken) return;
+    S.zoom = 1;
     await renderPages(token);
     setStatus(S.hl.length ? 'Saved' : '');
     pollTranscripts();
@@ -1773,8 +1774,9 @@
 
   async function renderPages(token, keep) {
     const wrap = $('#pages');
-    const avail = Math.min(document.documentElement.clientWidth - 16, 1100);
+    const avail = Math.min(document.documentElement.clientWidth - 16, 1100) * (S.zoom || 1);
     S.width = document.documentElement.clientWidth;
+    wrap.classList.toggle('zoomed', (S.zoom || 1) > 1.001);
     wrap.innerHTML = '';
     S.pages = [];
     const dpr = Math.min(window.devicePixelRatio || 1, 3);
@@ -1788,7 +1790,8 @@
       div.style.width = vp.width + 'px'; div.style.height = vp.height + 'px';
       div.style.setProperty('--scale-factor', String(scale));
       const canvas = document.createElement('canvas');
-      canvas.width = Math.floor(vp.width * dpr); canvas.height = Math.floor(vp.height * dpr);
+      const pdpr = Math.min(dpr, Math.sqrt(16e6 / (vp.width * vp.height)));   // iPad canvases stop drawing above ~16 million pixels
+      canvas.width = Math.floor(vp.width * pdpr); canvas.height = Math.floor(vp.height * pdpr);
       canvas.style.width = vp.width + 'px'; canvas.style.height = vp.height + 'px';
       const text = document.createElement('div'); text.className = 'textLayer';
       const over = document.createElement('div'); over.className = 'overlay';
@@ -1796,12 +1799,16 @@
       wrap.appendChild(div);
       const P = { n, div, text, over, scale };
       S.pages.push(P);
-      await page.render({ canvasContext: canvas.getContext('2d'), viewport: vp, transform: dpr !== 1 ? [dpr, 0, 0, dpr, 0, 0] : null }).promise;
+      await page.render({ canvasContext: canvas.getContext('2d'), viewport: vp, transform: pdpr !== 1 ? [pdpr, 0, 0, pdpr, 0, 0] : null }).promise;
       if (token !== S.loadToken) return;
       const tc = await page.getTextContent();
       await pdfjsLib.renderTextLayer({ textContentSource: tc, container: text, viewport: vp, textDivs: [] }).promise;
       drawHighlights(P);
-      if (keep && keep.page === n) window.scrollTo(0, div.getBoundingClientRect().top + window.scrollY + keep.frac * vp.height - keep.offset);
+      if (keep && keep.page === n) {
+        const br = div.getBoundingClientRect();
+        const x = keep.fracX != null ? br.left + window.scrollX + keep.fracX * vp.width - keep.offsetX : 0;
+        window.scrollTo(Math.max(0, x), br.top + window.scrollY + keep.frac * vp.height - keep.offset);
+      }
     }
   }
 
@@ -2293,6 +2300,65 @@
     }
   });
   pagesEl.addEventListener('pointercancel', () => { stroke = null; tap = null; clearPreview(); });
+
+  // ------------------------------------------------------------ zooming the PDF, not the page
+  // Pinching (or a trackpad pinch / ctrl+scroll on a laptop) zooms only the pages; the bar at the top and the
+  // highlight sheet at the bottom keep their size (Darrin, 14 November 2026). While the fingers move, the pages are
+  // scaled with CSS; when they lift, the pages are drawn again, sharp, at the new size, with the point that was under
+  // the fingers kept in place.
+  S.zoom = 1;
+  const ZMIN = 1, ZMAX = 4;
+  document.addEventListener('gesturestart', e => e.preventDefault());     // Safari: no zooming of the whole page
+  document.addEventListener('gesturechange', e => e.preventDefault());
+  let pinch = null;
+  const pinchDist = t => Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
+  function startScale(mx, my) {
+    const r = pagesEl.getBoundingClientRect();
+    pagesEl.style.transformOrigin = (mx - r.left) + 'px ' + (my - r.top) + 'px';
+  }
+  pagesEl.addEventListener('touchstart', e => {
+    if (e.touches.length !== 2 || !S.pdf) return;
+    e.preventDefault();
+    stroke = null; tap = null; clearPreview();                             // a second finger ends any pen stroke
+    const mx = (e.touches[0].clientX + e.touches[1].clientX) / 2, my = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+    pinch = { d0: pinchDist(e.touches), s: 1, mx, my };
+    startScale(mx, my);
+  }, { passive: false });
+  pagesEl.addEventListener('touchmove', e => {
+    if (!pinch || e.touches.length !== 2) return;
+    e.preventDefault();
+    const z = Math.min(ZMAX, Math.max(ZMIN, S.zoom * pinchDist(e.touches) / pinch.d0));
+    pinch.s = z / S.zoom;
+    pagesEl.style.transform = 'scale(' + pinch.s + ')';
+  }, { passive: false });
+  function endPinch() {
+    if (!pinch) return;
+    const p = pinch; pinch = null;
+    setZoom(S.zoom * p.s, p.mx, p.my);
+  }
+  pagesEl.addEventListener('touchend', e => { if (e.touches.length < 2) endPinch(); });
+  pagesEl.addEventListener('touchcancel', endPinch);
+  let wheelZoom = null, wheelTimer = null;
+  pagesEl.addEventListener('wheel', e => {                                // trackpad pinch arrives as ctrl+wheel
+    if (!e.ctrlKey || !S.pdf) return;
+    e.preventDefault();
+    if (!wheelZoom) { wheelZoom = { s: 1, mx: e.clientX, my: e.clientY }; startScale(e.clientX, e.clientY); }
+    wheelZoom.s = Math.min(ZMAX / S.zoom, Math.max(ZMIN / S.zoom, wheelZoom.s * Math.exp(-e.deltaY / 200)));
+    pagesEl.style.transform = 'scale(' + wheelZoom.s + ')';
+    clearTimeout(wheelTimer);
+    wheelTimer = setTimeout(() => { const w = wheelZoom; wheelZoom = null; setZoom(S.zoom * w.s, w.mx, w.my); }, 250);
+  }, { passive: false });
+  async function setZoom(z, mx, my) {
+    z = Math.min(ZMAX, Math.max(ZMIN, z));
+    pagesEl.style.transform = '';
+    if (Math.abs(z - S.zoom) < 0.02 || !S.pages.length) return;
+    const P = S.pages.find(p => { const r = p.div.getBoundingClientRect(); return my >= r.top && my <= r.bottom; }) || S.pages[0];
+    const r = P.div.getBoundingClientRect();
+    S.zoom = z;
+    await renderPages(++S.loadToken, { page: P.n, frac: (my - r.top) / r.height, offset: my,
+                                        fracX: (mx - r.left) / r.width, offsetX: mx });
+  }
+  S.setZoom = setZoom;                                                     // for testing from the console
 
   function hitTest(x, y) {
     for (const b of $$('.badge', pagesEl)) {
