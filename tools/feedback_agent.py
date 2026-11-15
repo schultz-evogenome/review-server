@@ -18,6 +18,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -162,6 +163,8 @@ class Agent:
         try:
             self.ensure_clone()
             self.run(['git', 'fetch', '-q', 'origin'], cwd=self.repo, check=False, timeout=300)
+            if self.a.sandbox:
+                cmd = self.sandboxed(cmd)
             r = self.run(cmd, cwd=self.repo, timeout=self.a.timeout, check=False, env={'PATH': self.a.path + os.pathsep + os.environ.get('PATH', '')})
             (runs / (stamp + '.json')).write_text(r.stdout or r.stderr or '')
             try:
@@ -186,6 +189,31 @@ class Agent:
                 pass
         finally:
             self.status('idle')
+
+    def sandboxed(self, cmd):
+        """Claude's command inside bubblewrap: the whole disk read-only except the agent's folder and Claude's own
+        settings, /tmp fresh for each run, the user's service manager out of reach (so nothing can be restarted),
+        and the folders given with --hide (and ~/.ssh) empty. The agent token stays readable, so Claude can reply."""
+        bwrap = shutil.which('bwrap')
+        if not bwrap:
+            raise RuntimeError('--sandbox needs bubblewrap (bwrap), which is not installed')
+        home = Path.home()
+        args = [bwrap, '--ro-bind', '/', '/', '--dev', '/dev', '--tmpfs', '/dev/shm', '--proc', '/proc', '--tmpfs', '/tmp',
+                '--tmpfs', '/run/user/%d' % os.getuid(), '--die-with-parent', '--new-session']
+        for p in [home / '.ssh'] + [Path(h).expanduser() for h in self.a.hide]:
+            if p.is_dir():
+                args += ['--tmpfs', str(p)]
+            elif p.exists():
+                args += ['--ro-bind', '/dev/null', str(p)]
+        for p in [self.work, home / '.claude', home / '.claude.json'] + [Path(w).expanduser() for w in self.a.writable]:
+            if p.exists():
+                args += ['--bind', str(p), str(p)]
+        for p in [Path(r).expanduser() for r in self.a.readable]:
+            if p.exists():
+                args += ['--ro-bind', str(p), str(p)]
+        if self.token_path.is_file():
+            args += ['--ro-bind', str(self.token_path), str(self.token_path)]
+        return args + ['--chdir', str(self.repo), '--'] + cmd
 
     # ------------------------------------------------------------ putting a commit live
 
@@ -314,6 +342,11 @@ def main(argv=None):
     ap.add_argument('--push-url', default='', help='where to push, for example git@github.com:owner/repo.git')
     ap.add_argument('--forbid', action='append', default=[], help='a word that must never be published (repeat for more); '
                     'this computer\'s name and the home folder are always refused')
+    ap.add_argument('--sandbox', action='store_true', help='run Claude inside bubblewrap (bwrap): read-only except its own '
+                    'folder, no service manager, ~/.ssh and --hide folders empty')
+    ap.add_argument('--hide', action='append', default=[], help='with --sandbox: a folder or file Claude must not see (repeat)')
+    ap.add_argument('--writable', action='append', default=[], help='with --sandbox: another folder Claude may write (repeat)')
+    ap.add_argument('--readable', action='append', default=[], help='with --sandbox: a folder inside a hidden one that Claude may read (repeat)')
     ap.add_argument('--git-name', default='', help='the author of the agent\'s commits (set in its clone only)')
     ap.add_argument('--git-email', default='', help='the author\'s email, for example a GitHub no-reply address')
     ap.add_argument('--once', action='store_true', help='look once and stop (for testing)')

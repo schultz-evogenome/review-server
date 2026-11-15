@@ -146,6 +146,44 @@ class FeedbackAgent(unittest.TestCase):
         self.assertEqual(git('rev-parse', 'main', cwd=self.github), before)
         self.assertIn('would publish "bold"', self.messages()[-1]['text'])
 
+    def test_the_sandbox_is_read_only_but_for_the_agent(self):
+        fa = self.agent()
+        hidden = self.tmp / 'private-documents'
+        hidden.mkdir()
+        (self.tmp / 'work').mkdir()
+        (hidden / 'tools').mkdir()
+        a = fa.argparse.Namespace(**dict(vars(self.parsed()), sandbox=True, hide=[str(hidden)], writable=[], readable=[str(hidden / 'tools')]))
+        agent = fa.Agent(a)
+        fa.shutil.which = lambda name: '/usr/bin/bwrap'
+        args = agent.sandboxed(['claude', '-p', 'hi'])
+        joined = ' '.join(args)
+        self.assertEqual(args[:5], ['/usr/bin/bwrap', '--ro-bind', '/', '/', '--dev'])
+        self.assertIn('--tmpfs %s' % hidden, joined)                               # hidden
+        self.assertIn('--tmpfs /run/user/', joined)                                # no service manager
+        self.assertIn('--bind %s %s' % (agent.work, agent.work), joined)           # its own folder is writable
+        self.assertNotIn('--bind %s' % self.live, joined)                          # the live checkout is not
+        self.assertIn('--ro-bind %s %s' % (agent.token_path, agent.token_path), joined)
+        self.assertLess(joined.index('--tmpfs %s' % hidden), joined.index('--ro-bind %s' % (hidden / 'tools')))  # put back after hiding
+        self.assertEqual(args[-4:], ['--', 'claude', '-p', 'hi'])
+
+    def parsed(self):
+        fa = self.agent()
+        ap = fa.argparse.ArgumentParser()
+        captured = {}
+        real = fa.argparse.ArgumentParser.parse_args
+        def grab(parser, argv=None, namespace=None):
+            ns = real(parser, argv, namespace)
+            captured['ns'] = ns
+            raise SystemExit(0)
+        fa.argparse.ArgumentParser.parse_args = grab
+        try:
+            fa.main(self.args)
+        except SystemExit:
+            pass
+        finally:
+            fa.argparse.ArgumentParser.parse_args = real
+        return captured['ns']
+
     def test_an_offer_older_than_the_live_app_is_not_put_live(self):
         fa = self.agent()
         self.post('/api/feedback', {'text': 'Put the title in bold, please.'})
