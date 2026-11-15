@@ -700,6 +700,116 @@ class FigureRegions(Base):
             self.assertEqual(self.call('GET', '/api/items/%s/regions/%s' % (iid, name))[0], 404)
 
 
+class Shapes(FigureRegions):
+    tracing = [{'closed': True, 'nodes': [[0.2, 0.2, 0.2, 0.2, 0.3, 0.1], [0.5, 0.5, 0.45, 0.4, 0.55, 0.6], [0.2, 0.6, 0.25, 0.6, 0.15, 0.6]]},
+               {'closed': False, 'nodes': [[0.6, 0.1, 0.6, 0.1, 0.6, 0.1], [0.8, 0.3, 0.8, 0.3, 0.8, 0.3]]}]
+
+    def test_a_blob_keeps_its_outline_and_box(self):
+        iid, folder = self.queue('Figure_v1.pdf')
+        mark = self.mark()
+        mark['region'] = {'shape': 'blob', 'page': 1, 'x': 0, 'y': 0, 'w': 1, 'h': 1,
+                          'points': [[0.1, 0.2], [0.4, 0.15], [0.45, 0.5], [0.15, 0.55]]}
+        code, result = self.save(iid, [mark], images={'figure1': self.png})
+        r = result['highlights']['highlights'][0]['region']
+        self.assertEqual((code, r['shape'], len(r['points'])), (200, 'blob', 4))
+        self.assertEqual((round(r['x'], 3), round(r['y'], 3), round(r['w'], 3), round(r['h'], 3)), (0.1, 0.15, 0.35, 0.4))  # the box encloses it
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            review.main(['show', str(folder), '--root', str(self.tmp / 'repo')])
+        self.assertIn('hand-drawn outline (blob) of 4 points', out.getvalue())
+
+    def test_a_tracing_writes_an_svg_at_the_image_size(self):
+        iid, folder = self.queue('Figure_v1.pdf')
+        mark = self.mark()
+        mark['region'] = {'shape': 'vector', 'page': 1, 'x': 0, 'y': 0, 'w': 1, 'h': 1, 'size': [600, 800],
+                          'paths': json.loads(json.dumps(self.tracing))}
+        code, result = self.save(iid, [mark], images={'figure1': self.png})
+        self.assertEqual(code, 200)
+        svg = (folder / 'regions' / 'figure1.svg').read_text()
+        self.assertIn('viewBox="0 0 600 800"', svg)
+        self.assertIn('d="M 120 160 C 180 80 270 320 300 400 C 330 480 150 480 120 480 C 90 480 120 160 120 160 Z" fill="#000"', svg)
+        self.assertIn('fill="none" stroke="#000"', svg)                  # the open shape is a line
+        with urllib.request.urlopen(self.base + '/api/items/%s/regions/figure1.svg' % iid) as r:
+            self.assertEqual(r.headers['Content-Type'], 'image/svg+xml')
+            self.assertIn('sandbox', r.headers['Content-Security-Policy'])
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            review.main(['show', str(folder), '--root', str(self.tmp / 'repo')])
+        self.assertIn('A vector tracing: 2 shapes (1 closed, 1 open), 5 points', out.getvalue())
+        self.assertIn('Tracing as SVG (600 by 800', out.getvalue())
+        # Editing it rewrites the SVG and replaces the close-up, unlike a box, whose close-up stays as first seen.
+        other = 'iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAQAAABeK7cBAAAADUlEQVR42mP8z8DAAAAEAQEAzjPylgAAAABJRU5ErkJggg=='
+        mark['region']['paths'][0]['nodes'][0][0] = 0.25
+        code, _ = self.save(iid, [mark], base=1, images={'figure1': other})
+        self.assertEqual(code, 200)
+        self.assertIn('M 150 160', (folder / 'regions' / 'figure1.svg').read_text())
+        self.assertEqual((folder / 'regions' / 'figure1.png').read_bytes(), base64.b64decode(other))
+
+    def test_bad_shapes_are_refused(self):
+        iid, folder = self.queue('Figure_v1.pdf')
+        bad = [{'shape': 'star'},
+               {'shape': 'blob', 'points': [[0.1, 0.1], [0.2, 0.2]]},
+               {'shape': 'blob', 'points': [[0.1, 0.1], [1.2, 0.2], [0.3, 0.3]]},
+               {'shape': 'vector', 'paths': []},
+               {'shape': 'vector', 'paths': [{'nodes': [[0.1, 0.1, 0.1]]}]},
+               {'shape': 'vector', 'paths': [{'nodes': [[0.1, 0.1, 5, 0.1, 0.1, 0.1]]}]},
+               {'shape': 'vector', 'size': [-1, 3], 'paths': self.tracing}]
+        for extra in bad:
+            mark = self.mark()
+            mark['region'] = dict({'page': 1, 'x': 0.1, 'y': 0.1, 'w': 0.1, 'h': 0.1}, **extra)
+            self.assertEqual(self.save(iid, [mark])[0], 400, extra)
+        self.assertFalse((folder / 'highlights.json').exists())
+
+
+class AppFeedback(Base):
+    def agent(self, path, body):
+        token = (self.state.parent / 'agent-token').read_text().strip()
+        req = urllib.request.Request(self.base + path, data=json.dumps(body).encode(), method='POST',
+                                     headers={'X-Review': '1', 'Content-Type': 'application/json', 'X-Review-Agent': token})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.load(r)
+
+    def test_messages_choices_and_status(self):
+        self.store.feedback.agent_token(create=True)
+        code, r = self.call('POST', '/api/feedback', {'text': 'Make the buttons bigger'})
+        self.assertEqual((code, r['message']['from']), (200, 'you'))
+        ask = self.agent('/api/feedback', {'text': 'Done; put it live?', 'choices': ['Put it live', 'Not yet'], 'deploy': 'abc1234'})['message']
+        self.assertEqual((ask['from'], ask['answer'], ask['deploy']), ('agent', None, 'abc1234'))
+        self.agent('/api/feedback/agent', {'state': 'working', 'note': 'making the buttons bigger'})
+        data = self.call('GET', '/api/feedback')[1]
+        self.assertEqual([m['from'] for m in data['messages']], ['you', 'agent'])
+        self.assertEqual(data['agent']['state'], 'working')
+        code, r = self.call('POST', '/api/feedback/%s/answer' % ask['id'], {'choice': 'Put it live'})
+        self.assertEqual((code, r['message']['answer']), (200, 'Put it live'))
+        self.assertEqual(self.call('POST', '/api/feedback/%s/answer' % ask['id'], {'choice': 'Not yet'})[0], 400)   # once
+        self.assertEqual(self.call('POST', '/api/feedback/nothing/answer', {'choice': 'x'})[0], 404)
+        self.assertTrue((self.state.parent / 'feedback.json').is_file())
+
+    def test_only_the_agent_speaks_as_the_agent(self):
+        self.store.feedback.agent_token(create=True)
+        code, r = self.call('POST', '/api/feedback', {'text': 'hi', 'choices': ['a', 'b'], 'deploy': 'abc1234'})
+        self.assertEqual((r['message']['from'], 'choices' in r['message'], 'deploy' in r['message']), ('you', False, False))
+        self.assertEqual(self.call('POST', '/api/feedback/agent', {'state': 'working'})[0], 403)
+        bad = urllib.request.Request(self.base + '/api/feedback', data=b'{"text": "x"}', method='POST',
+                                     headers={'X-Review': '1', 'Content-Type': 'application/json', 'X-Review-Agent': 'wrong'})
+        with urllib.request.urlopen(bad, timeout=10) as resp:
+            self.assertEqual(json.load(resp)['message']['from'], 'you')
+        self.assertEqual(self.call('POST', '/api/feedback', {'text': '   '})[0], 400)
+        self.assertEqual(oct((self.state.parent / 'agent-token').stat().st_mode & 0o777), '0o600')
+
+    def test_the_agent_command(self):
+        self.store.feedback.agent_token(create=True)
+        self.call('POST', '/api/feedback', {'text': 'Please add a dark blue theme'})
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            review.main(['feedback', 'say', 'Shall', 'I?', '--choice', 'Yes', '--choice', 'No', '--server', self.base, '--state', str(self.state)])
+        mid = out.getvalue().strip()
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            review.main(['feedback', 'status', 'working', '--note', 'theming', '--server', self.base, '--state', str(self.state)])
+            review.main(['feedback', 'list', '--server', self.base, '--state', str(self.state)])
+        self.assertIn('you: Please add a dark blue theme', out.getvalue())
+        self.assertIn(mid + '  ', out.getvalue())
+        self.assertIn('[choices: Yes | No; answer: not yet]', out.getvalue())
+        self.assertEqual(self.call('GET', '/api/feedback')[1]['agent']['note'], 'theming')
+
+
 class NoAutoClose(Base):
     auto_close = False
 

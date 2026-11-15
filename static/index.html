@@ -21,6 +21,7 @@
     <button id="addBtn" hidden title="Add a PDF or text file from this device to the queue">Add file</button>
     <input type="file" id="addFile" accept="application/pdf,.pdf,text/plain,.txt,text/markdown,.md,.markdown,.tex" hidden>
     <input type="file" id="imageFile" accept="image/*,application/pdf,.pdf,.svg" hidden>
+    <button id="fbBtn" hidden title="Messages with the agent that looks after this app">Feedback <span id="fbCount" class="count" hidden></span></button>
     <button id="refresh" title="Reload the queue">Refresh</button>
     <button id="doneBtn" class="primary" hidden>Done</button>
   </div>
@@ -30,7 +31,11 @@
       <button data-tool="change">Change pen</button>
       <button data-tool="discuss">Discuss pen</button>
     </span>
-    <button data-box hidden aria-pressed="false" title="Drag a box around part of a figure">Box</button>
+<span class="seg" data-shapes hidden role="group" aria-label="Mark an area">
+      <button data-shape="box" aria-pressed="false" title="Drag a box around part of a figure">Box</button>
+      <button data-shape="blob" aria-pressed="false" title="Draw a loop around part of a figure">Blob</button>
+      <button data-shape="trace" aria-pressed="false" title="Trace a figure with vector shapes">Trace</button>
+    </span>
     <label class="check"><input type="checkbox" id="finger"> Finger draws</label>
     <span class="spacer"></span>
     <button id="listBtn">List</button>
@@ -41,7 +46,11 @@
       <button data-ttool="change">Change pen</button>
       <button data-ttool="discuss">Discuss pen</button>
     </span>
-    <button data-box hidden aria-pressed="false" title="Drag a box around part of a figure">Box</button>
+<span class="seg" data-shapes hidden role="group" aria-label="Mark an area">
+      <button data-shape="box" aria-pressed="false" title="Drag a box around part of a figure">Box</button>
+      <button data-shape="blob" aria-pressed="false" title="Draw a loop around part of a figure">Blob</button>
+      <button data-shape="trace" aria-pressed="false" title="Trace a figure with vector shapes">Trace</button>
+    </span>
     <label class="check"><input type="checkbox" id="vimOn"> Vim keys</label>
     <span class="seg" role="group" aria-label="Text size">
       <button id="sizeDown" title="Smaller text" aria-label="Smaller text">A&minus;</button>
@@ -96,6 +105,7 @@
       <button data-settag="discuss">Discuss</button>
     </span>
     <button id="recBtn" title="Record a voice note for this highlight">&#9679; Record</button>
+    <button id="sheetTrace" hidden>Edit tracing</button>
     <span class="spacer"></span>
     <button id="sheetDelete" class="danger">Delete</button>
     <button id="sheetClose" class="primary">Close</button>
@@ -107,6 +117,20 @@
 </section>
 
 <aside id="list" hidden aria-label="Highlights"></aside>
+
+<aside id="fbPanel" hidden aria-label="App feedback">
+  <div class="fb-head">
+    <b>App feedback</b>
+    <span class="spacer"></span>
+    <button id="fbClose">Close</button>
+  </div>
+  <p id="fbAgent" class="muted"></p>
+  <div id="fbList"></div>
+  <form id="fbForm">
+    <textarea id="fbText" rows="3" placeholder="Tell the app's agent what to change or fix. Tap the microphone on the keyboard to dictate."></textarea>
+    <button type="submit" class="primary">Send</button>
+  </form>
+</aside>
 
 <aside id="imagesPanel" hidden aria-label="Images"></aside>
 
@@ -121,6 +145,34 @@
     <span class="spacer"></span>
     <button id="addCancel">Cancel</button>
     <button id="addGo" class="primary">Add to queue</button>
+  </div>
+</section>
+
+<section id="trace" hidden aria-label="Trace a figure">
+  <div class="trace-bar">
+    <button id="trCancel">Cancel</button>
+    <b>Trace</b>
+    <span class="seg" role="group" aria-label="Tracing tool">
+      <button data-trmode="draw" class="on" title="Tap to add a corner point, drag to pull out a curve (P)">Draw</button>
+      <button data-trmode="edit" title="Move points and handles; tap a curve to add a point (V)">Edit</button>
+    </span>
+    <button id="trSmooth" disabled>Make smooth</button>
+    <button id="trDelete" disabled>Delete point</button>
+    <button id="trClose" disabled>Close shape</button>
+    <button id="trNew">New shape</button>
+    <span class="seg" role="group" aria-label="History">
+      <button id="trUndo" disabled title="Undo (Cmd-Z)">Undo</button>
+      <button id="trRedo" disabled title="Redo (Shift-Cmd-Z)">Redo</button>
+    </span>
+    <button id="trFill" aria-pressed="false" title="Show closed shapes filled, as a silhouette">Silhouette</button>
+    <button id="trFit" title="Fit the figure to the screen">Fit</button>
+    <span class="spacer"></span>
+    <button id="trDone" class="primary">Done</button>
+  </div>
+  <div id="trStage">
+    <canvas id="trCanvas"></canvas>
+    <svg id="trSvg" aria-hidden="true"></svg>
+    <div id="trHint"></div>
   </div>
 </section>
 

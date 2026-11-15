@@ -235,6 +235,51 @@ button.discuss { background: var(--discuss-solid); border-color: var(--discuss-s
 .region-box.discuss { border-color: #3666dd; background: rgba(66, 133, 244, 0.10); }
 .region-box.open { outline: 2px solid #222; outline-offset: 2px; }
 .region-box.trial { border-style: dashed; }
+.region-box.blob, .region-box.vector { border: none; background: none; }
+/* messages with the agent that looks after this app */
+#fbPanel { position: fixed; top: 0; right: 0; bottom: 0; z-index: 40; display: flex; flex-direction: column; width: min(480px, 100%);
+  background: var(--bg); border-left: 1px solid var(--line); box-shadow: -8px 0 28px rgba(0, 0, 0, 0.18); padding-top: env(safe-area-inset-top); }
+#fbPanel[hidden] { display: none; }
+.fb-head { display: flex; align-items: center; gap: 8px; padding: 12px 14px 4px; font-size: 17px; }
+#fbAgent { margin: 0 14px 8px; font-size: 13px; }
+#fbList { flex: 1; overflow-y: auto; padding: 4px 14px 12px; -webkit-overflow-scrolling: touch; }
+.fb-msg { max-width: 85%; margin: 8px 0; padding: 9px 12px; border-radius: 16px; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 15px; line-height: 1.4; }
+.fb-msg.you { margin-left: auto; background: var(--accent); color: var(--accent-fg); border-bottom-right-radius: 5px; }
+.fb-msg.agent { margin-right: auto; background: var(--card); border: 1px solid var(--line); border-bottom-left-radius: 5px; }
+.fb-time { display: block; margin-top: 4px; font-size: 11px; opacity: 0.7; }
+.fb-choices { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; white-space: normal; }
+.fb-choices button { min-height: 34px; font-size: 14px; }
+.fb-choices button.chosen { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
+.fb-answer { margin-top: 6px; font-size: 13px; color: var(--muted); white-space: normal; }
+#fbForm { display: flex; gap: 8px; align-items: flex-end; padding: 10px 14px calc(env(safe-area-inset-bottom) + 10px); border-top: 1px solid var(--line); background: var(--card); }
+#fbText { flex: 1; font: inherit; font-size: 16px; padding: 8px 10px; border-radius: 12px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); resize: none; }
+.fb-banner { display: flex; align-items: center; gap: 10px; margin: 14px 0 0; padding: 10px 14px; border-radius: 14px; background: var(--card); border: 1px solid var(--accent); font-size: 15px; }
+.fb-banner span { flex: 1; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+.region-box svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; }
+.region-box svg path { fill: rgba(255, 193, 7, 0.16); stroke: #b76d00; stroke-width: 2; vector-effect: non-scaling-stroke; stroke-linejoin: round; }
+.region-box.discuss svg path { fill: rgba(66, 133, 244, 0.13); stroke: #3666dd; }
+.region-box svg path.open { fill: none; }
+.region-box.trial svg path { stroke-dasharray: 5 4; }
+/* tracing a figure with vector shapes, full screen */
+#trace { position: fixed; inset: 0; z-index: 60; display: flex; flex-direction: column; background: var(--bg); }
+#trace[hidden] { display: none; }
+.trace-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: calc(env(safe-area-inset-top) + 8px) 12px 8px; background: var(--card); border-bottom: 1px solid var(--line); }
+.trace-bar button[disabled] { opacity: 0.4; cursor: default; }
+#trStage { position: relative; flex: 1; overflow: hidden; touch-action: none; cursor: crosshair; background: var(--bg); }
+#trCanvas { position: absolute; left: 0; top: 0; transform-origin: 0 0; box-shadow: 0 1px 6px rgba(0, 0, 0, 0.25); background: #fff; }
+#trStage.filled #trCanvas { opacity: 0.28; }
+#trSvg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; }
+.tr-path { fill: none; stroke: #ff2d55; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.tr-path.closed { fill: rgba(255, 45, 85, 0.1); }
+#trStage.filled .tr-path.closed { fill: #000; stroke: none; }
+#trStage.filled .tr-path:not(.closed) { stroke: #000; stroke-width: 3; }
+.tr-node { fill: #fff; stroke: #ff2d55; stroke-width: 1.5; }
+.tr-node.sel { fill: #ff2d55; }
+.tr-node.first { stroke-width: 3; }
+.tr-handle-line { stroke: #0a84ff; stroke-width: 1; }
+.tr-handle { fill: #0a84ff; stroke: #fff; stroke-width: 1; }
+.tr-band { fill: none; stroke: #ff2d55; stroke-width: 1.5; stroke-dasharray: 4 4; opacity: 0.8; }
+#trHint { position: absolute; left: 12px; bottom: calc(env(safe-area-inset-bottom) + 10px); max-width: calc(100% - 24px); padding: 5px 10px; border-radius: 8px; background: var(--card); color: var(--muted); font-size: 13px; pointer-events: none; box-shadow: 0 1px 4px rgba(0, 0, 0, 0.15); }
 .region-box .badge { top: 0; left: 0; transform: translate(-2px, -50%); }
 .figure-surface { display: inline-block; position: relative; max-width: 100%; vertical-align: top; line-height: 0; }
 .cm-figure .figure-surface img, .cm-figure .figure-surface canvas { display: block; }

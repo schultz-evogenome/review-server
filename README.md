@@ -71,11 +71,13 @@ The server then loads the speech model when the first clip arrives, keeps it in 
 - **Older versions.** If older versions of a document are still waiting, its card says so ("2 older versions"). Tap that line to list them; each still opens. **Mark older done** closes them. If any of them has your highlights or voice notes, the card lists those and asks first. Closed versions go to Replaced, labeled with the version that replaced them, not to Done.
 - **Select** (the default). Touch and hold to select text, drag the handles, then tap Change or Discuss at the bottom of the screen.
 - **Change pen** and **Discuss pen.** Draw over text with the Pencil. Your finger still scrolls. Without a Pencil, turn on Finger draws, and turn it off again to scroll.
-- **Figure areas.** Choose Change pen or Discuss pen, turn on **Box**, and drag diagonally around the part of a figure you mean. It works anywhere on a PDF, including scanned pages with no selectable text. The box gets a number and the same Add note, Record, Undo, and tag controls as a text highlight. Tap inside it or on its number to return to the notes. Turn Box off to highlight words again. Boxes stay aligned when the page changes size; each saves a close-up with the exact area outlined in red for agents to inspect.
+- **Figure areas.** Choose Change pen or Discuss pen, then **Box**, **Blob**, or **Trace**. With Box, drag diagonally around the part of a figure you mean; with Blob, draw a loop around it. It works anywhere on a PDF, including scanned pages with no selectable text. The mark gets a number and the same Add note, Record, Undo, and tag controls as a text highlight. Tap inside it or on its number to return to the notes. Tap the chosen shape again to highlight words. Marks stay aligned when the page changes size; each saves a close-up with the exact area outlined in red for agents to inspect.
+- **Tracing.** With **Trace** chosen, tap a figure or page: it opens full screen for drawing vector shapes over it, for example the outline an agent turns into a silhouette (a PhyloPic). With **Draw**, tap to place a corner point, drag as you place one to pull out a curve, and tap the first point to close the shape; **New shape** starts another, and a shape left open is a line. With **Edit**, drag points and their handles, tap a curve to add a point there, and use **Make smooth**/**Make corner**, **Delete point**, and **Close shape**. A smooth point keeps its two handles in line. The Pencil or a mouse draws; one finger moves the figure and two fingers zoom (on a laptop, scroll to move and pinch or Ctrl-scroll to zoom). **Silhouette** shows closed shapes filled black. **Undo** and **Redo** step through every change; on a keyboard, Cmd-Z, Delete, Enter (end the shape), P (Draw), and V (Edit) work too. **Done** saves the tracing as one numbered mark with a close-up; its panel has **Edit tracing** to change it later, and Undo right after puts back the version before.
 - **Numbers.** Each highlight gets a number in the left margin, in the order you make them. Numbers are never reused, so you can say "4, cut it" when you talk through the review.
 - **Notes.** Tap a highlight or its number to change its tag, add a note (the microphone key on the keyboard dictates), or delete it. Right after you make a highlight, "Add note," "Record," and "Undo" appear for a few seconds.
 - **Voice notes.** Tap Record in a highlight's panel (or right after making the highlight), talk, and tap Stop. The clip is saved with that highlight, where you can play it back or delete it (two taps), and its text appears under it a few seconds later. Safari asks for the microphone the first time. The number in the margin shows ✎ for a note and ♪ for a voice note.
 - **List** shows every highlight with its number, text, and note. Tap one to jump to it.
+- **Sections.** Each time you open the app, only **Waiting** is open; Done, Replaced, Archived, and Trash start closed, so the queue is never scrolled past by accident.
 - **Swipe a card left** for **Archive** and **Trash**, as in Mail; swipe all the way to archive it, and **Undo** appears for a few seconds. On a Mac, swipe with two fingers on the trackpad, or drag with the mouse. Archiving a card archives its older waiting versions with it. Neither deletes anything: archived and trashed items keep all their files and marks, wait under **Archived** and **Trash** at the bottom of the queue, and a swipe there restores them to where they were. `show` and `pull` say when an item was archived or trashed.
 - **Done** marks the item finished and returns to the queue. Open a finished item and tap Reopen to keep working on it. Reopen also brings a replaced version back to Waiting.
 
@@ -103,7 +105,7 @@ The iPad keyboard's dictation works as in any text box.
 
 Highlights move with the text as you edit it. If you delete all of a highlight's words it stays in the list, with its voice notes, marked as gone. If the text is replaced (Revert, or using another device's version), each highlight finds its words again nearby, if they are still there. In a Markdown file's Preview you can do the same: draw across the rendered words, tap a highlight to open it, or with **Edit** chosen select text and tap Change or Discuss. The highlight lands on those words in the source, on both sides.
 
-**Figures in text files.** With either pen chosen, drag across an image to box an area of it; this works both in the editor and in Markdown Preview, including the first page of an embedded PDF figure. The box is attached to that image reference, so adding or removing paragraphs above it does not move the mark. The same image shown in both panes shows the same boxes. Choose Edit to open an image by itself as before. A figure removed from the text keeps its marks, notes, and saved close-ups in List. Images loaded from another website may prevent a close-up from being saved; in that case the box location is still kept and the page tells you.
+**Figures in text files.** With either pen chosen, drag across an image to box an area of it (or choose Blob or Trace, as on a PDF); this works both in the editor and in Markdown Preview, including the first page of an embedded PDF figure. The box is attached to that image reference, so adding or removing paragraphs above it does not move the mark. The same image shown in both panes shows the same boxes. Choose Edit to open an image by itself as before. A figure removed from the text keeps its marks, notes, and saved close-ups in List. Images loaded from another website may prevent a close-up from being saved; in that case the box location is still kept and the page tells you.
 
 ## Versions
 
@@ -190,7 +192,37 @@ Each highlight has `n` (its number), `tag` ("change" or "discuss"), `page`, `tex
 
 A figure mark also has `region`: `{x, y, w, h, page}` for a PDF, or `{x, y, w, h, image}` for an image reference in a text file. These coordinates are fractions from 0 to 1, independent of screen size; `text` and `rects` are empty, and there is no text `anchor`. When a close-up was saved, `region.snapshot` is its filename under `regions/`, also available from `/api/items/<id>/regions/<filename>`. Crops are saved with the highlights in the same version-checked request. Deleting and undoing a mark preserves its crop.
 
+A blob also has `shape: "blob"` and `points`, its outline as `[x, y]` fractions. A tracing has `shape: "vector"`, `size` (the width and height of the image in pixels, or of the PDF page in points), and `paths`: each `{closed, nodes}`, where a node is `[x, y, in x, in y, out x, out y]`, the point and its two bezier handles, all fractions of the image (handles may reach a little past its edge). A segment runs from one node's out handle to the next node's in handle; a closed shape also joins the last node to the first. For both, `x, y, w, h` is the box around the shape. The server also writes each tracing as `regions/<highlight id>.svg`, at the image's own size, with closed shapes filled black and open ones as lines, ready to become a silhouette.
+
 To check the server, run `python3 -m unittest -q test_review`. Figure interaction checks use a temporary server and headless Chrome: `node tools/test-regions.mjs` (Node 22+ and Chrome, no npm packages). `CHROME` and `PYTHON` can select the executables. These checks use temporary documents and leave the real queue alone.
+
+## Feedback, and the app's agent
+
+The queue has a **Feedback** button. Write there what you would like changed or fixed in the app itself, from any device. One agent on the server reads it, makes the change in its own copy of the app, tests it, and answers in the same place. It can ask a question with buttons to tap; a banner on the queue says when it is waiting for you, and the button shows a count of new messages. Nothing it changes goes live until you tap **Put it live** on its message; then the server is restarted once nobody has saved anything for a minute, and the agent says when it is done. The panel also says whether the agent is there and what it is doing.
+
+To run the agent (on the machine with the server, with Claude Code installed and signed in):
+
+```
+python3 tools/feedback_agent.py --work /path/for/the/agent --live /path/to/this/checkout --service review-server
+```
+
+It keeps its own clone of the repository, its notes, and a log of each piece of work under `--work`. Claude Code works only in that clone, with a short list of tools (reading and editing files, git, python3, node), and never pushes, deploys, or restarts anything: the script does those, and only for a commit the reviewer chose to put live. Before that it runs the unit tests on exactly that commit, and refuses a commit older than what is live. With `--push-key` (an SSH deploy key that may write to the repository) and `--push-url`, it pushes the commit to GitHub first, so every copy stays the same; without one it says GitHub was not updated. `--path` puts folders first on Claude's PATH, for example a newer Node for `tools/test-regions.mjs`. Its standing instructions are `tools/feedback-agent.md`. As a systemd user service:
+
+```
+[Unit]
+Description=The agent that looks after the review queue
+After=review-server.service
+
+[Service]
+ExecStart=/usr/bin/python3 /path/to/this/checkout/tools/feedback_agent.py --work /path/for/the/agent --live /path/to/this/checkout --service review-server
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target
+```
+
+Messages are kept in `feedback.json` beside the server's other state (`~/.config/review-server/` unless `--state` says otherwise). Only a program holding `agent-token` from that folder, which the server makes on first start, can write as the agent; agents reply with `python3 review.py feedback say "..." [--choice ...] [--deploy <commit>]`, read with `review.py feedback list`, and say what they are doing with `review.py feedback status working --note "..."`. Each message you send starts a piece of work by Claude Code on the server's account. Check the agent end to end, with a stand-in for Claude, with `python3 -m unittest -q tools.test_feedback_agent`.
 
 ## Notes
 

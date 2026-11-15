@@ -481,9 +481,30 @@ def clean_highlights(raw):
 
 
 def clean_region(raw):
-    """A box in fractions of the page/image, from its top-left corner; independent of display size."""
+    """A box in fractions of the page/image, from its top-left corner; independent of display size. A blob also
+    has its outline (points), and a vector tracing its shapes (paths of bezier nodes); for both the box is
+    recomputed here to enclose them."""
     if not isinstance(raw, dict):
         raise ValueError('region must be an object')
+    shape = raw.get('shape', 'box')
+    if shape not in ('box', 'blob', 'vector'):
+        raise ValueError('figure mark shape must be box, blob, or vector')
+    extra = {}
+    if shape == 'blob':
+        extra['points'] = clean_points(raw.get('points'))
+        xs, ys = [p[0] for p in extra['points']], [p[1] for p in extra['points']]
+        raw = dict(raw, **enclosing(xs, ys))
+    elif shape == 'vector':
+        extra['paths'] = clean_paths(raw.get('paths'))
+        xs = [v for p in extra['paths'] for n in p['nodes'] for v in (n[0], n[2], n[4])]
+        ys = [v for p in extra['paths'] for n in p['nodes'] for v in (n[1], n[3], n[5])]
+        raw = dict(raw, **enclosing([min(1.0, max(0.0, v)) for v in xs], [min(1.0, max(0.0, v)) for v in ys]))
+        size = raw.get('size')
+        if size is not None:
+            if (not isinstance(size, list) or len(size) != 2
+                    or not all(isinstance(v, (int, float)) and math.isfinite(v) and 0 < v <= 100000 for v in size)):
+                raise ValueError('vector size must be [width, height] of the image')
+            extra['size'] = [round(float(v), 2) for v in size]
     box = {k: float(raw[k]) for k in ('x', 'y', 'w', 'h')}
     if (not all(math.isfinite(v) and 0 <= v <= 1 for v in box.values())
             or min(box['w'], box['h']) <= 0 or box['x'] + box['w'] > 1.000001
@@ -500,7 +521,79 @@ def clean_region(raw):
         box['page'] = page
     else:
         raise ValueError('figure mark needs either a page or an image reference')
+    if shape != 'box':
+        box['shape'] = shape
+        box.update(extra)
     return box
+
+
+def enclosing(xs, ys):
+    """The box around some points, at least a little wide and high."""
+    x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
+    w, h = max(x1 - x0, 0.0005), max(y1 - y0, 0.0005)
+    return {'x': min(x0, 1 - w), 'y': min(y0, 1 - h), 'w': w, 'h': h}
+
+
+def fraction(v, low=0.0, high=1.0):
+    v = float(v)
+    if not math.isfinite(v) or not low <= v <= high:
+        raise ValueError('figure mark points must lie on the page or image')
+    return round(v, 6)
+
+
+def clean_points(raw):
+    if not isinstance(raw, list) or not 3 <= len(raw) <= 4000:
+        raise ValueError('a blob needs 3 to 4000 points')
+    return [[fraction(p[0]), fraction(p[1])] for p in raw]
+
+
+def clean_paths(raw):
+    """Shapes of nodes [x, y, in-handle x, y, out-handle x, y]; handles may reach a little past the edge."""
+    if not isinstance(raw, list) or not 1 <= len(raw) <= 200:
+        raise ValueError('a tracing needs 1 to 200 shapes')
+    out = []
+    for p in raw:
+        if not isinstance(p, dict) or not isinstance(p.get('nodes'), list) or not 1 <= len(p['nodes']) <= 4000:
+            raise ValueError('each shape needs 1 to 4000 points')
+        nodes = []
+        for n in p['nodes']:
+            if not isinstance(n, list) or len(n) != 6:
+                raise ValueError('each point needs x, y and two handles')
+            nodes.append([fraction(n[0]), fraction(n[1])] + [fraction(v, -1.0, 2.0) for v in n[2:]])
+        out.append({'closed': bool(p.get('closed')) and len(nodes) >= 2, 'nodes': nodes})
+    if sum(len(p['nodes']) for p in out) > 20000:
+        raise ValueError('a tracing can have at most 20000 points')
+    return out
+
+
+def path_data(paths, width, height):
+    """SVG path data for a tracing, in units of the given width and height."""
+    f = lambda v, scale: ('%.2f' % (v * scale)).rstrip('0').rstrip('.')
+    pt = lambda x, y: '%s %s' % (f(x, width), f(y, height))
+    out = []
+    for p in paths:
+        nodes = p['nodes']
+        d = ['M ' + pt(nodes[0][0], nodes[0][1])]
+        pairs = list(zip(nodes, nodes[1:])) + ([(nodes[-1], nodes[0])] if p['closed'] else [])
+        for a, b in pairs:
+            d.append('C %s %s %s' % (pt(a[4], a[5]), pt(b[2], b[3]), pt(b[0], b[1])))
+        if p['closed']:
+            d.append('Z')
+        out.append(' '.join(d))
+    return out
+
+
+def tracing_svg(region):
+    """A standalone SVG of a tracing at the image's own size: closed shapes filled black, open ones as lines."""
+    width, height = region.get('size') or [1000.0, 1000.0 * region['h'] / max(region['w'], 1e-9)]
+    fmt = lambda v: ('%.2f' % v).rstrip('0').rstrip('.')
+    body = []
+    for p, d in zip(region['paths'], path_data(region['paths'], width, height)):
+        body.append('  <path d="%s" %s/>' % (d, 'fill="#000" fill-rule="evenodd"' if p['closed']
+                                               else 'fill="none" stroke="#000" stroke-width="%s" stroke-linecap="round"'
+                                               % fmt(max(width, height) / 400)))
+    return ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 %s %s" width="%s" height="%s">\n%s\n</svg>\n'
+            % (fmt(width), fmt(height), fmt(width), fmt(height), '\n'.join(body)))
 
 
 def region_images(raw, highlights):
@@ -587,6 +680,20 @@ def format_review(s, highlights, path=None, texts=None, text=None, server=None):
         out.append('%d. **%s**, %s%s' % (h.get('n', 0), h.get('tag'), where,
                                        '' if region else ': "%s"' % one(h.get('text', ''))))
         if region:
+            kind = region.get('shape', 'box')
+            if kind == 'blob':
+                out.append('   A hand-drawn outline (blob) of %d points around the area; the box below encloses it.' % len(region['points']))
+            elif kind == 'vector':
+                closed = sum(1 for p in region['paths'] if p['closed'])
+                out.append('   A vector tracing: %d shape%s (%d closed, %d open), %d points. Closed shapes are filled outlines, '
+                           'open ones are lines.' % (len(region['paths']), '' if len(region['paths']) == 1 else 's', closed,
+                                                     len(region['paths']) - closed, sum(len(p['nodes']) for p in region['paths'])))
+                svg = h.get('id', '') + '.svg'
+                target = (str(Path(path) / 'regions' / svg) if path else
+                          '%s/api/items/%s/regions/%s' % (server.rstrip('/'), s['id'], svg) if server else 'regions/' + svg)
+                size = region.get('size')
+                out.append('   Tracing as SVG%s: %s' % (' (%s by %s, the image\'s own size)' % tuple(
+                    ('%.2f' % v).rstrip('0').rstrip('.') for v in size) if size else '', target))
             out.append('   Box from top-left: x %.2f%%, y %.2f%%, width %.2f%%, height %.2f%% of the %s.'
                        % (*(100 * region[k] for k in ('x', 'y', 'w', 'h')), 'image' if 'image' in region else 'page'))
             snapshot = region.get('snapshot')
@@ -711,8 +818,8 @@ def cmd_show(a):
 
 # ---------------------------------------------------------------- remote commands
 
-def http_call(url, data=None, method='GET', ctype=None):
-    headers = {'X-Review': '1'}
+def http_call(url, data=None, method='GET', ctype=None, extra=None):
+    headers = dict({'X-Review': '1'}, **(extra or {}))
     if ctype:
         headers['Content-Type'] = ctype
     if os.environ.get('REVIEW_TOKEN'):
@@ -756,6 +863,37 @@ def cmd_push(a):
                 print('Sent image %s.' % ref)
             else:
                 print('Image not found, so not sent: %s' % ref, file=sys.stderr)
+
+
+def cmd_feedback(a):
+    """For the app's agent: read the reviewer's messages, reply (with choices to tap), and say what it is doing."""
+    base = a.server.rstrip('/')
+    folder = Path(a.state).expanduser().parent if a.state else Path.home() / '.config' / 'review-server'
+    token = Feedback(folder).agent_token()
+    agent = {'X-Review-Agent': token} if token else {}
+    if a.action == 'list':
+        data = http_call(base + '/api/feedback')
+        msgs = data['messages']
+        if a.after:
+            ids = [m['id'] for m in msgs]
+            msgs = msgs[ids.index(a.after) + 1:] if a.after in ids else msgs
+        if a.json:
+            print(json.dumps({'messages': msgs, 'agent': data.get('agent', {})}, indent=2, ensure_ascii=False))
+            return
+        for m in msgs:
+            extra = ''
+            if m.get('choices'):
+                extra = '  [choices: %s; answer: %s]' % (' | '.join(m['choices']), m.get('answer') or 'not yet')
+            print('%s  %s  %s: %s%s' % (m['id'], m['at'], m['from'], m['text'], extra))
+        return
+    if not token:
+        sys.exit('No agent token in %s; start the server once to make one.' % folder)
+    if a.action == 'say':
+        body = {'text': ' '.join(a.text), 'choices': a.choice or None, 'deploy': a.deploy}
+        print(http_call(base + '/api/feedback', json.dumps(body).encode(), 'POST', 'application/json', agent)['message']['id'])
+    elif a.action == 'status':
+        http_call(base + '/api/feedback/agent', json.dumps({'state': a.text[0] if a.text else 'idle', 'note': a.note}).encode(),
+                  'POST', 'application/json', agent)
 
 
 def cmd_pull(a):
@@ -873,6 +1011,88 @@ class Transcriber:
 
 # ---------------------------------------------------------------- server
 
+class Feedback:
+    """Messages between the reviewer and one agent that looks after this app. The reviewer writes from the page;
+    the agent, which holds a token kept beside the server's other state, writes with review.py feedback.
+    The agent can offer choices, which the reviewer answers with a tap, and say what it is doing."""
+    def __init__(self, folder):
+        self.path = folder / 'feedback.json' if folder else None
+        self.token_path = folder / 'agent-token' if folder else None
+        self.lock = threading.Lock()
+        self.memory = {'messages': [], 'agent': {}}
+
+    def agent_token(self, create=False):
+        if not self.token_path:
+            return ''
+        if self.token_path.is_file():
+            return self.token_path.read_text().strip()
+        if not create:
+            return ''
+        self.token_path.parent.mkdir(parents=True, exist_ok=True)
+        token = secrets.token_urlsafe(24)
+        self.token_path.write_text(token + '\n')
+        os.chmod(str(self.token_path), 0o600)
+        return token
+
+    def is_agent(self, given):
+        token = self.agent_token()
+        return bool(token and given and secrets.compare_digest(given, token))
+
+    def load(self):
+        if not self.path:
+            return self.memory
+        data = read_json(self.path, None)
+        return data if isinstance(data, dict) and isinstance(data.get('messages'), list) else {'messages': [], 'agent': {}}
+
+    def save(self, data):
+        if not self.path:
+            self.memory = data
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        write_json(self.path, data)
+
+    def add(self, sender, text, choices=None, deploy=None):
+        text = str(text or '').strip()
+        if not text or len(text) > 20000:
+            raise ValueError('a message needs some text, up to 20000 characters')
+        msg = {'id': 'm' + format(int(time.time() * 1000), 'x') + secrets.token_hex(2), 'from': sender, 'text': text, 'at': now()}
+        if sender == 'agent' and choices:
+            if not isinstance(choices, list) or len(choices) > 6 or not all(isinstance(c, str) and 0 < len(c.strip()) <= 80 for c in choices):
+                raise ValueError('choices must be up to 6 short labels')
+            msg['choices'] = [c.strip() for c in choices]
+            msg['answer'] = None
+        if sender == 'agent' and deploy:
+            if not re.fullmatch(r'[0-9a-f]{7,40}', str(deploy)):
+                raise ValueError('deploy must be a commit id')
+            msg['deploy'] = str(deploy)
+        with self.lock:
+            data = self.load()
+            data['messages'] = (data['messages'] + [msg])[-2000:]
+            self.save(data)
+        return msg
+
+    def answer(self, mid, choice):
+        with self.lock:
+            data = self.load()
+            msg = next((m for m in data['messages'] if m.get('id') == mid), None)
+            if not msg or not msg.get('choices'):
+                raise KeyError('no such question')
+            if msg.get('answer'):
+                raise ValueError('already answered: ' + msg['answer'])
+            if choice not in msg['choices']:
+                raise ValueError('not one of the choices')
+            msg['answer'], msg['answered_at'] = choice, now()
+            self.save(data)
+        return msg
+
+    def status(self, state, note):
+        with self.lock:
+            data = self.load()
+            data['agent'] = {'seen_at': now(), 'state': str(state or 'idle')[:20], 'note': str(note or '')[:300]}
+            self.save(data)
+        return data['agent']
+
+
 class Store:
     def __init__(self, roots, inbox, transcriber, auto_close=True, state=None):
         self.roots = roots
@@ -887,6 +1107,7 @@ class Store:
         # An item found waiting again was reopened (on the page or by deleting done.json), so it is left
         # open until a version higher than that one arrives.
         self.state = Path(state) if state else None
+        self.feedback = Feedback(self.state.parent if self.state else None)
         self.sweeping = threading.Lock()
         self.state_lock = threading.Lock()
         try:
@@ -1102,6 +1323,8 @@ def make_handler(store, token):
                 return self.static('/'.join(parts[1:]))
             if parts == ['keytest']:
                 return self.static('keytest.html')
+            if parts == ['api', 'feedback']:
+                return self.json_reply(200, store.feedback.load())
             if parts[:2] != ['api', 'items']:
                 return self.json_reply(404, {'error': 'not found'})
             if len(parts) == 2:
@@ -1136,9 +1359,11 @@ def make_handler(store, token):
                                       if ext == '.svg' else None)
             if len(parts) == 5 and parts[3] == 'regions':
                 p = item / 'regions' / parts[4]
-                if not re.fullmatch(r'[A-Za-z0-9_-]{1,40}\.png', parts[4]) or not p.is_file():
+                if not re.fullmatch(r'[A-Za-z0-9_-]{1,40}\.(png|svg)', parts[4]) or not p.is_file():
                     return self.json_reply(404, {'error': 'no such figure snapshot'})
-                return self.send_file(p, 'image/png')
+                # The SVG is written here from numbers only, and is sent so that nothing in it could run.
+                return self.send_file(p, 'image/png' if p.suffix == '.png' else 'image/svg+xml',
+                                      None if p.suffix == '.png' else {'Content-Security-Policy': "sandbox; default-src 'none'; style-src 'unsafe-inline'"})
             if parts[3:] == ['transcripts']:
                 return self.json_reply(200, {'transcripts': transcripts(item), 'transcribe': store.transcriber.ok})
             if len(parts) == 5 and parts[3] == 'audio':
@@ -1178,17 +1403,42 @@ def make_handler(store, token):
                     return self.json_reply(409, {'error': 'changed on another device', 'highlights': current})
                 if snapshots:
                     (item / 'regions').mkdir(exist_ok=True)
+                    traced = {h['id'] + '.png' for h in highlights if h.get('region', {}).get('shape') == 'vector'}
                     for name, body in snapshots.items():
-                        # A crop records what the reviewer saw at creation, even if the source changes later.
-                        if not (item / 'regions' / name).exists():
+                        # A crop records what the reviewer saw at creation, even if the source changes later. A
+                        # tracing is redrawn as it is edited, so its close-up follows it.
+                        if name in traced or not (item / 'regions' / name).exists():
                             write_bytes(item / 'regions' / name, body)
                 for h in highlights:
                     if h.get('region') and (item / 'regions' / (h['id'] + '.png')).is_file():
                         h['region']['snapshot'] = h['id'] + '.png'
+                    if h.get('region', {}).get('shape') == 'vector':
+                        (item / 'regions').mkdir(exist_ok=True)
+                        write_bytes(item / 'regions' / (h['id'] + '.svg'), tracing_svg(h['region']).encode('utf-8'))
                 max_n = max([sent_max, current['max_n']] + [h['n'] for h in highlights])
                 new = {'version': current['version'] + 1, 'updated_at': now(), 'max_n': max_n, 'highlights': highlights}
                 write_json(item / 'highlights.json', new)
             self.json_reply(200, {'highlights': new, 'item': summary(root, item)})
+
+        def feedback(self, rest):
+            """The reviewer's messages to the app's agent, the agent's replies and status, and answers to its questions."""
+            agent = store.feedback.is_agent(self.headers.get('X-Review-Agent', ''))
+            try:
+                data = self.body()
+                if rest == []:
+                    msg = store.feedback.add('agent' if agent else 'you', data.get('text'), data.get('choices'), data.get('deploy'))
+                    return self.json_reply(200, {'message': msg})
+                if rest == ['agent']:
+                    if not agent:
+                        return self.json_reply(403, {'error': 'only the app\'s agent can say what it is doing'})
+                    return self.json_reply(200, {'agent': store.feedback.status(data.get('state'), data.get('note'))})
+                if len(rest) == 2 and rest[1] == 'answer' and not agent:
+                    return self.json_reply(200, {'message': store.feedback.answer(rest[0], data.get('choice'))})
+            except KeyError as e:
+                return self.json_reply(404, {'error': str(e).strip("'")})
+            except (ValueError, TypeError, AttributeError) as e:
+                return self.json_reply(400, {'error': str(e)})
+            return self.json_reply(404, {'error': 'not found'})
 
         def save_text(self, root, item, iid):
             """Save the reviewer's edits, unless the file changed since this page read it. The file as queued
@@ -1238,6 +1488,8 @@ def make_handler(store, token):
                 return self.upload()
             if parts == ['api', 'keylog']:
                 return self.save_keylog()
+            if parts[:2] == ['api', 'feedback']:
+                return self.feedback(parts[2:])
             if parts[:2] != ['api', 'items'] or parts[3:] not in (['done'], ['audio'], ['images']):
                 return self.json_reply(404, {'error': 'not found'})
             found = self.item(parts)
@@ -1442,6 +1694,7 @@ def cmd_serve(a):
     transcriber = Transcriber()
     state = Path(a.state).expanduser() if a.state else Path.home() / '.config' / 'review-server' / 'replaced.json'
     store = Store(roots, inbox, transcriber, auto_close=not a.no_auto_close, state=state)
+    store.feedback.agent_token(create=True)
     server = http.server.ThreadingHTTPServer((host, a.port), make_handler(store, token))
     server.daemon_threads = True
     closed = store.sweep()
@@ -1514,6 +1767,16 @@ def main(argv=None):
     pu.add_argument('--group', help='what it belongs to, shown on its card (for example an application folder)')
     pu.add_argument('--doc', help='the document this is a version of (default: the file name before its _v<number>)')
     pu.add_argument('--version', type=int, help='its version number (default: the _v<number> in the file name)')
+    fb = sub.add_parser('feedback', help='for the app\'s agent: read and answer the reviewer\'s messages about the app')
+    fb.add_argument('action', choices=['list', 'say', 'status'])
+    fb.add_argument('text', nargs='*', help='the message to say, or the state (idle, working)')
+    fb.add_argument('--server', default='http://127.0.0.1:8765')
+    fb.add_argument('--choice', action='append', help='a choice the reviewer can tap; repeat for more')
+    fb.add_argument('--deploy', help='the commit the choices are about putting live')
+    fb.add_argument('--note', default='', help='with status: what the agent is doing')
+    fb.add_argument('--after', help='with list: only messages after this id')
+    fb.add_argument('--json', action='store_true')
+    fb.add_argument('--state', help='the server\'s state file, to find the agent token (default ~/.config/review-server/replaced.json)')
     pl = sub.add_parser('pull', help='list a review server\'s items, or print one item\'s highlights')
     pl.add_argument('item', nargs='?')
     pl.add_argument('--server', required=True)
@@ -1523,7 +1786,7 @@ def main(argv=None):
         ap.print_help()
         return 2
     {'queue': cmd_queue, 'list': cmd_list, 'show': cmd_show, 'serve': cmd_serve,
-     'push': cmd_push, 'pull': cmd_pull}[a.cmd](a)
+     'push': cmd_push, 'pull': cmd_pull, 'feedback': cmd_feedback}[a.cmd](a)
     return 0
 
 

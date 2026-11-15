@@ -15,7 +15,7 @@
     pages: [],         // {n, div, text, over, scale}
     pdf: null,
     tool: 'select',
-    box: false,
+    shape: null,       // marking areas: 'box', 'blob', or 'trace'
     regionsEnabled: false,
     regionImages: new Map(),  // crops waiting to be saved with their figure marks
     finger: false,
@@ -115,6 +115,7 @@
     $('#tools').hidden = true; $('#back').hidden = true; $('#doneBtn').hidden = true; $('#refresh').hidden = false;
     $('#addBtn').hidden = true;
     $('#title').textContent = 'Review queue'; document.title = 'Review queue'; setStatus('');
+    $('#fbBtn').hidden = false;
     const q = $('#queue');
     if (!q.querySelector('.swipe')) q.innerHTML = '<p class="muted">Loading&hellip;</p>';
     const open = Q.open;
@@ -157,7 +158,92 @@
       section('archived', 'Archived', archived, 'Put away. Swipe left on one to restore it.') +
       section('trashed', 'Trash', trashed, 'Nothing here is deleted: the files stay where they are. Swipe left on one to restore it.');
     SW.open = null;
+    q.insertAdjacentHTML('afterbegin', '<div id="fbBanner"></div>');
+    renderFbBanner();
+    loadFeedback();
   }
+
+  // ------------------------------------------------------------ messages with the app's agent
+
+  // One agent on the server looks after this app. Write to it here; it answers here, can offer choices to tap,
+  // and says what it is doing. Nothing it changes goes live until you tap to put it live.
+  const FB = { data: { messages: [], agent: {} }, open: false, timer: null };
+  const fbSeen = () => pref.get('review.fbSeen') || '';
+  function fbUnread() {
+    const msgs = FB.data.messages, seen = fbSeen(), i = msgs.findIndex(m => m.id === seen);
+    return msgs.slice(i + 1).filter(m => m.from === 'agent').length;
+  }
+  const fbWaiting = () => FB.data.messages.filter(m => m.from === 'agent' && m.choices && !m.answer);
+  async function loadFeedback() {
+    try { FB.data = await api('/api/feedback'); } catch (e) { return; }
+    const n = fbUnread() + fbWaiting().filter(m => FB.data.messages.findIndex(x => x.id === m.id) <= FB.data.messages.findIndex(x => x.id === fbSeen())).length;
+    $('#fbCount').textContent = n; $('#fbCount').hidden = !n;
+    renderFbBanner();
+    if (FB.open) renderFeedback();
+    clearTimeout(FB.timer);
+    FB.timer = setTimeout(() => { if (!$('#queue').hidden || FB.open) loadFeedback(); }, FB.open ? 8000 : 30000);
+  }
+  function renderFbBanner() {
+    const box = $('#fbBanner');
+    if (!box) return;
+    const ask = fbWaiting().slice(-1)[0], unread = fbUnread();
+    if (!ask && !unread) { box.innerHTML = ''; return; }
+    const m = ask || FB.data.messages.filter(x => x.from === 'agent').slice(-1)[0];
+    box.innerHTML = '<div class="fb-banner"><span><b>' + (ask ? 'The app\'s agent asks:' : 'The app\'s agent wrote:') + '</b> ' + esc(oneLine(m.text)) + '</span>' +
+      '<button class="primary" id="fbBannerOpen">' + (ask ? 'Answer' : 'Read') + '</button></div>';
+    $('#fbBannerOpen').addEventListener('click', openFeedback);
+  }
+  function agentLine(a) {
+    if (!a || !a.seen_at) return 'No agent has connected yet. Your messages will wait for it.';
+    const ago = (Date.now() - new Date(a.seen_at).getTime()) / 60000;
+    if (ago > 5) return 'The app\'s agent last checked in ' + fmtTime(a.seen_at) + '. Your messages will wait for it.';
+    return 'The app\'s agent is ' + (a.state === 'working' ? 'working' + (a.note ? ': ' + a.note : '') : 'here, and reads new messages within a minute') + '.';
+  }
+  function renderFeedback() {
+    const list = $('#fbList'), atEnd = list.scrollHeight - list.scrollTop - list.clientHeight < 40;
+    $('#fbAgent').textContent = agentLine(FB.data.agent);
+    list.innerHTML = FB.data.messages.length ? FB.data.messages.map(m => '<div class="fb-msg ' + (m.from === 'agent' ? 'agent' : 'you') + '" data-id="' + esc(m.id) + '">' +
+      esc(m.text) + (m.deploy ? '\n<span class="muted">commit ' + esc(m.deploy.slice(0, 7)) + '</span>' : '') +
+      (m.choices ? '<div class="fb-choices">' + m.choices.map(c => '<button data-choice="' + esc(c) + '"' + (m.answer ? ' disabled' : '') +
+        (m.answer === c ? ' class="chosen"' : '') + '>' + esc(c) + '</button>').join('') + '</div>' +
+        (m.answer ? '<div class="fb-answer">You chose ' + esc(m.answer) + '</div>' : '') : '') +
+      '<span class="fb-time">' + esc(fmtTime(m.at)) + '</span></div>').join('')
+      : '<p class="muted">Tell the agent that looks after this app what you would like changed or fixed. It replies here.</p>';
+    if (atEnd || !FB.rendered) list.scrollTop = list.scrollHeight;
+    FB.rendered = true;
+    const last = FB.data.messages.slice(-1)[0];
+    if (last) pref.set('review.fbSeen', last.id);
+    $('#fbCount').hidden = true;
+    renderFbBanner();
+  }
+  function openFeedback() {
+    FB.open = true; FB.rendered = false;
+    $('#fbPanel').hidden = false;
+    renderFeedback();
+    loadFeedback();
+  }
+  $('#fbBtn').addEventListener('click', () => { if (FB.open) { FB.open = false; $('#fbPanel').hidden = true; } else openFeedback(); });
+  $('#fbClose').addEventListener('click', () => { FB.open = false; $('#fbPanel').hidden = true; renderFbBanner(); });
+  $('#fbForm').addEventListener('submit', async e => {
+    e.preventDefault();
+    const box = $('#fbText'), text = box.value.trim();
+    if (!text) return;
+    box.disabled = true;
+    try { await api('/api/feedback', { method: 'POST', body: JSON.stringify({ text }) }); box.value = ''; FB.rendered = false; }
+    catch (err) { toast('Could not send that: ' + err.message, 5000); }
+    box.disabled = false;
+    loadFeedback();
+  });
+  $('#fbText').addEventListener('keydown', e => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) $('#fbForm').requestSubmit(); });
+  $('#fbList').addEventListener('click', async e => {
+    const b = e.target.closest('[data-choice]');
+    if (!b || b.disabled) return;
+    const id = b.closest('.fb-msg').dataset.id;
+    $$('button', b.parentNode).forEach(x => { x.disabled = true; });
+    try { await api('/api/feedback/' + encodeURIComponent(id) + '/answer', { method: 'POST', body: JSON.stringify({ choice: b.dataset.choice }) }); }
+    catch (err) { toast('Could not send that: ' + err.message, 5000); }
+    loadFeedback();
+  });
 
   // ------------------------------------------------------------ swiping a card away
 
@@ -323,6 +409,14 @@
   // ------------------------------------------------------------ versions of one document
 
   const Q = { cards: new Map(), open: new Set() };   // waiting card id -> {item, older}; sections left open
+  // Coming back to the app shows only Waiting open, so the queue is never scrolled past by accident.
+  let hiddenSince = 0;
+  const collapseSections = () => { Q.open.clear(); $$('#queue details[open]').forEach(d => { d.open = false; }); };
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') { hiddenSince = Date.now(); return; }
+    if (hiddenSince) { collapseSections(); if (!$('#queue').hidden) loadFeedback(); }
+  });
+  window.addEventListener('pageshow', e => { if (e.persisted) collapseSections(); });
   $('#queue').addEventListener('toggle', e => {
     const k = e.target.dataset && e.target.dataset.key;
     if (k) { if (e.target.open) Q.open.add(k); else Q.open.delete(k); }
@@ -1303,7 +1397,10 @@
   const fromOf = a => ({ line: a.line, ch: a.ch }), toOf = a => ({ line: a.end_line, ch: a.end_ch });
 
   function placeOf(h) {
-    if (h.region) return h.region.image ? 'figure: ' + refLabel(h.region.image) : 'figure on page ' + h.region.page;
+    if (h.region) {
+      const what = h.region.shape === 'vector' ? 'tracing' : 'figure';
+      return h.region.image ? what + ': ' + refLabel(h.region.image) : what + ' on page ' + h.region.page;
+    }
     if (h.rects && h.rects.length) return 'page ' + h.page;
     return h.anchor ? 'line ' + (h.anchor.line + 1) : 'its text is gone';
   }
@@ -1407,7 +1504,7 @@
     $('#editor').classList.toggle('drawing', tool !== 'edit');
     $('#preview').classList.toggle('drawing', tool !== 'edit');
     applyReadOnly();
-    if (tool === 'edit') setBox(false);
+    if (tool === 'edit') setShape(null);
     if (tool !== 'edit') {
       $('#selbar').hidden = true;
       if (T.cm && T.cm.somethingSelected()) T.cm.setCursor(T.cm.getCursor());
@@ -1466,7 +1563,7 @@
     const badge = e.target.closest && e.target.closest('#hlBadges .badge');
     TX.tap = { x: e.clientX, y: e.clientY, t: Date.now(), n: badge ? Number(badge.dataset.n) : null };
     if (badge) { e.stopPropagation(); return; }
-    if (S.textTool === 'edit' || S.box || e.button > 0 || e.pointerType === 'touch' || (e.target.closest && e.target.closest('.cm-figure'))) return;
+    if (S.textTool === 'edit' || S.shape || e.button > 0 || e.pointerType === 'touch' || (e.target.closest && e.target.closest('.cm-figure'))) return;
     e.preventDefault(); e.stopPropagation();
     try { editorEl.setPointerCapture(e.pointerId); } catch (err) { /* synthetic events */ }
     TX.stroke = { id: e.pointerId, x0: e.clientX, y0: e.clientY, tag: S.textTool, moved: false };
@@ -1659,7 +1756,7 @@
     return pointAt(e.clientX, s && Math.abs(e.clientY - s.y0) < 0.7 * row ? s.y0 : e.clientY);
   };
   previewEl.addEventListener('pointerdown', e => {
-    if (!T.cm || !PV.on || S.textTool === 'edit' || S.box || e.button > 0 || e.target.closest('.cm-figure')) return;
+    if (!T.cm || !PV.on || S.textTool === 'edit' || S.shape || e.button > 0 || e.target.closest('.cm-figure')) return;
     TX.tap = { x: e.clientX, y: e.clientY, t: Date.now(), n: null };
     if (e.pointerType === 'touch') return;
     e.preventDefault();
@@ -1743,6 +1840,7 @@
     teardown();
     const token = S.loadToken;
     $('#queue').hidden = true; $('#viewer').hidden = false; $('#undoBar').hidden = true;
+    $('#fbBtn').hidden = true; $('#fbPanel').hidden = true; FB.open = false;
     $('#tools').hidden = false; $('#back').hidden = false; $('#doneBtn').hidden = false; $('#refresh').hidden = true;
     $('#addBtn').hidden = true; $('#addPanel').hidden = true;
     setStatus('');
@@ -1753,7 +1851,7 @@
     if (token !== S.loadToken) return;
     S.item = data.item;
     S.regionsEnabled = !!data.figure_regions;
-    $$('[data-box]').forEach(b => { b.hidden = !S.regionsEnabled; });
+    $$('[data-shapes]').forEach(b => { b.hidden = !S.regionsEnabled; });
     S.version = data.highlights.version;
     S.hl = data.highlights.highlights || [];
     S.deleted = new Set();
@@ -1881,22 +1979,79 @@
   // Boxes use fractions of the complete page/image, so they survive zooming, reflow, and another device.
   // A crop records the visual content at creation; notes and audio belong to the same numbered highlight.
   let regionStroke = null, regionTap = null, regionClickUntil = 0;
-  function setBox(on) {
-    S.box = on;
-    $$('[data-box]').forEach(b => { b.classList.toggle('on', on); b.setAttribute('aria-pressed', String(on)); });
-    if (on) {
+  const SHAPE_HINT = { box: 'Drag a box around the area, then add a note or recording.',
+    blob: 'Draw a loop around the area, then add a note or recording.', trace: 'Tap a figure or page to trace it with vector shapes.' };
+  function setShape(shape) {
+    S.shape = shape || null;
+    $$('[data-shape]').forEach(b => { const on = b.dataset.shape === S.shape; b.classList.toggle('on', on); b.setAttribute('aria-pressed', String(on)); });
+    if (S.shape) {
       if (T.cm && S.textTool === 'edit') setTextTool('change');
       else if (!T.cm && S.tool === 'select') setTool('change');
-      toast('Drag a box around the area, then add a note or recording.');
+      toast(SHAPE_HINT[S.shape], 3000);
     }
     cancelRegion();
   }
-  $$('[data-box]').forEach(b => b.addEventListener('click', () => setBox(!S.box)));
+  $$('[data-shape]').forEach(b => b.addEventListener('click', () => setShape(S.shape === b.dataset.shape ? null : b.dataset.shape)));
+
+  // A blob's outline and a tracing's shapes, in fractions of the whole page or image.
+  const SVGNS = 'http://www.w3.org/2000/svg';
+  function pathsD(paths, X = v => v, Y = v => v) {
+    return paths.map(p => {
+      const n = p.nodes, d = ['M' + X(n[0][0]) + ' ' + Y(n[0][1])];
+      const pairs = n.slice(1).map((b, i) => [n[i], b]).concat(p.closed ? [[n[n.length - 1], n[0]]] : []);
+      for (const [a, b] of pairs) d.push('C' + X(a[4]) + ' ' + Y(a[5]) + ' ' + X(b[2]) + ' ' + Y(b[3]) + ' ' + X(b[0]) + ' ' + Y(b[1]));
+      return d.join(' ') + (p.closed ? 'Z' : '');
+    });
+  }
+  function outlineSvg(r) {
+    const svg = document.createElementNS(SVGNS, 'svg');
+    svg.setAttribute('viewBox', r.x + ' ' + r.y + ' ' + r.w + ' ' + r.h);
+    svg.setAttribute('preserveAspectRatio', 'none');
+    const add = (d, open) => { const p = document.createElementNS(SVGNS, 'path'); p.setAttribute('d', d); if (open) p.setAttribute('class', 'open'); svg.appendChild(p); };
+    if (r.shape === 'blob') add('M' + r.points.map(p => p[0] + ' ' + p[1]).join(' L') + (r.trail ? '' : 'Z'), !!r.trail);
+    else pathsD(r.paths).forEach((d, i) => add(d, !r.paths[i].closed));
+    return svg;
+  }
+  function insidePolygon(p, pts) {
+    let inside = false;
+    for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+      const [xi, yi] = pts[i], [xj, yj] = pts[j];
+      if ((yi > p.y) !== (yj > p.y) && p.x < (xj - xi) * (p.y - yi) / (yj - yi) + xi) inside = !inside;
+    }
+    return inside;
+  }
+  function enclosing(xs, ys) {
+    const clamp = v => Math.max(0, Math.min(1, v));
+    const x0 = clamp(Math.min(...xs)), x1 = clamp(Math.max(...xs)), y0 = clamp(Math.min(...ys)), y1 = clamp(Math.max(...ys));
+    const w = Math.max(x1 - x0, 0.0005), h = Math.max(y1 - y0, 0.0005);
+    return { x: Math.min(x0, 1 - w), y: Math.min(y0, 1 - h), w, h };
+  }
+  // Fewer points for the same outline (Ramer-Douglas-Peucker), measured on screen.
+  function simplify(pts, tol, sx, sy) {
+    if (pts.length < 3) return pts;
+    const keep = new Array(pts.length).fill(false);
+    keep[0] = keep[pts.length - 1] = true;
+    const stack = [[0, pts.length - 1]];
+    while (stack.length) {
+      const [a, b] = stack.pop();
+      let far = -1, best = 0;
+      const ax = pts[a][0] * sx, ay = pts[a][1] * sy, bx = pts[b][0] * sx, by = pts[b][1] * sy, len = Math.hypot(bx - ax, by - ay);
+      for (let i = a + 1; i < b; i++) {
+        const px = pts[i][0] * sx, py = pts[i][1] * sy;
+        // A loop ends where it began: then measure from that point, not from a line of no length.
+        const d = len < 1e-6 ? Math.hypot(px - ax, py - ay) : Math.abs((by - ay) * px - (bx - ax) * py + bx * ay - by * ax) / len;
+        if (d > best) { best = d; far = i; }
+      }
+      if (best > tol) { keep[far] = true; stack.push([a, far], [far, b]); }
+    }
+    return pts.filter((_, i) => keep[i]);
+  }
 
   function regionBox(h, trial) {
     const r = h.region, box = document.createElement('div');
-    box.className = 'region-box ' + h.tag + (trial ? ' trial' : '') + (S.openN === h.n ? ' open' : '');
+    box.className = 'region-box ' + h.tag + (r.shape ? ' ' + r.shape : '') + (trial ? ' trial' : '') + (S.openN === h.n ? ' open' : '');
     box.style.cssText = 'left:' + r.x * 100 + '%;top:' + r.y * 100 + '%;width:' + r.w * 100 + '%;height:' + r.h * 100 + '%';
+    if (r.shape === 'blob' || r.shape === 'vector') box.appendChild(outlineSvg(r));
     if (!trial) {
       box.dataset.n = String(h.n);
       const b = document.createElement('span');
@@ -1941,7 +2096,7 @@
     return S.hl.slice().reverse().find(h => {
       const r = h.region;
       return r && (target.image ? r.image === target.image : r.page === target.page) &&
-        p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h;
+        p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h && (r.shape !== 'blob' || insidePolygon(p, r.points));
     });
   }
   function cancelRegion() {
@@ -1957,17 +2112,19 @@
     const target = regionTarget(e.target);
     if (!target || !target.source || !target.source.width) return;
     const tag = T.cm ? S.textTool : S.tool, pen = tag === 'change' || tag === 'discuss';
-    const box = pen && (S.box || target.image), hit = regionHit(target, e);
-    if (!box && !hit) return;
+    const mode = pen ? S.shape || (target.image ? 'box' : null) : null, hit = regionHit(target, e);
+    if (!mode && !hit) return;
     // A finger may tap a mark, but still scrolls unless the PDF's Finger draws control is checked.
-    regionTap = { target, id: e.pointerId, x: e.clientX, y: e.clientY };
+    regionTap = { target, id: e.pointerId, x: e.clientX, y: e.clientY, mode, tag };
     e.stopPropagation();
-    if (!box || (e.pointerType === 'touch' && (T.cm || !S.finger))) return;
+    if (!mode || (e.pointerType === 'touch' && (T.cm || !S.finger))) return;
     e.preventDefault();
     if (S.reopen) { toast('Reopen it to mark a figure'); return; }
+    if (mode === 'trace') return;                     // a tap opens the tracing editor
     const b = target.surface.getBoundingClientRect();
     if (!b.width || !b.height) return;
-    regionStroke = { target, id: e.pointerId, x: e.clientX, y: e.clientY, start: regionPoint(target, e), tag };
+    const start = regionPoint(target, e);
+    regionStroke = { target, id: e.pointerId, x: e.clientX, y: e.clientY, start, tag, mode, trail: [[start.x, start.y]] };
     try { target.surface.setPointerCapture(e.pointerId); } catch (err) { /* synthetic events */ }
   }, true);
   document.addEventListener('pointermove', e => {
@@ -1975,21 +2132,34 @@
     if (!s || e.pointerId !== s.id) return;
     e.preventDefault(); e.stopPropagation();
     $$('.region-box.trial', s.target.over).forEach(b => b.remove());
-    s.target.over.appendChild(regionBox({ region: regionBounds(s, e), tag: s.tag }, true));
+    if (s.mode === 'blob') {
+      const p = regionPoint(s.target, e), last = s.trail[s.trail.length - 1], b = s.target.surface.getBoundingClientRect();
+      if (Math.hypot((p.x - last[0]) * b.width, (p.y - last[1]) * b.height) >= 2) s.trail.push([p.x, p.y]);
+      s.target.over.appendChild(regionBox({ region: trailRegion(s, true), tag: s.tag }, true));
+    } else s.target.over.appendChild(regionBox({ region: regionBounds(s, e), tag: s.tag }, true));
   }, true);
+  function trailRegion(s, open) {
+    const b = s.target.surface.getBoundingClientRect();
+    const points = open ? s.trail : simplify(s.trail, 1.2, b.width, b.height);
+    return Object.assign({ shape: 'blob', points, trail: open }, enclosing(points.map(p => p[0]), points.map(p => p[1])),
+      s.target.image ? { image: s.target.image } : { page: s.target.page });
+  }
   document.addEventListener('pointerup', e => {
     const s = regionStroke, t = regionTap;
     if (!t || e.pointerId !== t.id) return;
     e.stopPropagation();
-    const r = s && regionBounds(s, e), b = t.target.surface.getBoundingClientRect();
+    const r = s && (s.mode === 'blob' ? trailRegion(s, false) : regionBounds(s, e)), b = t.target.surface.getBoundingClientRect();
     cancelRegion();
     regionClickUntil = Date.now() + 600;
-    if (s && r.w * b.width >= 6 && r.h * b.height >= 6) {
+    if (s && r.w * b.width >= 6 && r.h * b.height >= 6 && (s.mode !== 'blob' || r.points.length >= 3)) {
+      delete r.trail;
       e.preventDefault(); addRegion(r, s.tag, s.target); return;
     }
     if (Math.hypot(e.clientX - t.x, e.clientY - t.y) < 8) {
       const h = regionHit(t.target, e);
-      if (h) openSheet(h.n);
+      if (h && t.mode === 'trace' && h.region.shape === 'vector') openTrace(t.target, h.tag, h);
+      else if (h) openSheet(h.n);
+      else if (t.mode === 'trace' && !S.reopen) openTrace(t.target, t.tag, null);
     }
   }, true);
   document.addEventListener('pointercancel', e => {
@@ -2012,10 +2182,23 @@
     const ctx = canvas.getContext('2d');
     ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, canvas.width, canvas.height);
     ctx.drawImage(source, x * sw, y * sh, w * sw, h * sh, 0, 0, canvas.width, canvas.height);
-    const rx = (region.x - x) / w * canvas.width, ry = (region.y - y) / h * canvas.height;
-    const rw = region.w / w * canvas.width, rh = region.h / h * canvas.height;
-    ctx.strokeStyle = '#fff'; ctx.lineWidth = 4; ctx.strokeRect(rx, ry, rw, rh);
-    ctx.strokeStyle = '#d1242f'; ctx.lineWidth = 2; ctx.strokeRect(rx, ry, rw, rh);
+    const X = v => (v - x) / w * canvas.width, Y = v => (v - y) / h * canvas.height;
+    const outline = () => {
+      ctx.beginPath();
+      if (region.shape === 'blob') { region.points.forEach((p, i) => (i ? ctx.lineTo : ctx.moveTo).call(ctx, X(p[0]), Y(p[1]))); ctx.closePath(); }
+      else if (region.shape === 'vector') {
+        for (const p of region.paths) {
+          const n = p.nodes;
+          ctx.moveTo(X(n[0][0]), Y(n[0][1]));
+          const pairs = n.slice(1).map((b, i) => [n[i], b]).concat(p.closed ? [[n[n.length - 1], n[0]]] : []);
+          for (const [a, b] of pairs) ctx.bezierCurveTo(X(a[4]), Y(a[5]), X(b[2]), Y(b[3]), X(b[0]), Y(b[1]));
+          if (p.closed) ctx.closePath();
+        }
+      } else ctx.rect(X(region.x), Y(region.y), region.w / w * canvas.width, region.h / h * canvas.height);
+    };
+    ctx.lineJoin = 'round';
+    outline(); ctx.strokeStyle = '#fff'; ctx.lineWidth = 4; ctx.stroke();
+    outline(); ctx.strokeStyle = '#d1242f'; ctx.lineWidth = 2; ctx.stroke();
     return canvas.toDataURL('image/png').split(',')[1];
   }
   function addRegion(region, tag, target) {
@@ -2037,6 +2220,454 @@
     return S.regionImages.has(h.id) ? 'data:image/png;base64,' + S.regionImages.get(h.id)
       : '/api/items/' + S.item.id + '/regions/' + encodeURIComponent(h.region.snapshot);
   }
+  // ------------------------------------------------------------ tracing a figure with vector shapes
+
+  // For drawing outlines an agent can turn into a silhouette (a PhyloPic, say). The figure opens full screen. With
+  // Draw, a tap adds a corner point and a drag pulls out a curve; tapping the first point closes the shape. With
+  // Edit, points and their handles move, and a tap on a curve adds a point there. The Pencil or a mouse edits; one
+  // finger pans and two zoom. Shapes are kept in the figure's own pixels while editing, and saved as fractions of it.
+  const trEl = $('#trace'), trStage = $('#trStage'), trCanvas = $('#trCanvas'), trSvg = $('#trSvg');
+  let TR = { open: false };
+  const trClone = paths => paths.map(p => ({ closed: p.closed, nodes: p.nodes.map(n => Object.assign({}, n)) }));
+  const trDist = (ax, ay, bx, by) => Math.hypot(ax - bx, ay - by);
+  function trSmooth(n) {
+    const ia = Math.atan2(n.y - n.iy, n.x - n.ix), oa = Math.atan2(n.oy - n.y, n.ox - n.x);
+    const d = Math.abs(((ia - oa + Math.PI * 3) % (Math.PI * 2)) - Math.PI);
+    return trDist(n.x, n.y, n.ix, n.iy) > 0.01 && trDist(n.x, n.y, n.ox, n.oy) > 0.01 && d < 0.035;
+  }
+  async function traceSource(target) {
+    const c = document.createElement('canvas'), ctx = c.getContext('2d');
+    if (target.page) {
+      const page = await S.pdf.getPage(target.page), one = page.getViewport({ scale: 1 });
+      let scale = Math.min(4, 2800 / one.width);
+      if (one.width * one.height * scale * scale > 16e6) scale = Math.sqrt(16e6 / (one.width * one.height));
+      const vp = page.getViewport({ scale });
+      c.width = Math.floor(vp.width); c.height = Math.floor(vp.height);
+      ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
+      await page.render({ canvasContext: ctx, viewport: vp }).promise;
+      return { canvas: c, size: [one.width, one.height] };
+    }
+    const src = target.source, sw = src.naturalWidth || src.width, sh = src.naturalHeight || src.height;
+    const scale = sw * sh > 16e6 ? Math.sqrt(16e6 / (sw * sh)) : 1;
+    c.width = Math.max(1, Math.round(sw * scale)); c.height = Math.max(1, Math.round(sh * scale));
+    ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
+    ctx.drawImage(src, 0, 0, c.width, c.height);
+    return { canvas: c, size: [sw, sh] };
+  }
+  async function openTrace(target, tag, h) {
+    if (S.reopen) { toast('Reopen it to trace a figure'); return; }
+    if (!target || !target.source) { toast('That figure is not on screen'); return; }
+    let made;
+    try { made = await traceSource(target); } catch (e) { toast('Could not open the figure: ' + e.message, 5000); return; }
+    const W = made.canvas.width, H = made.canvas.height;
+    trCanvas.width = W; trCanvas.height = H;
+    trCanvas.getContext('2d').drawImage(made.canvas, 0, 0);
+    const paths = h && h.region.shape === 'vector' ? h.region.paths.map(p => ({ closed: p.closed, nodes: p.nodes.map(n => ({
+      x: n[0] * W, y: n[1] * H, ix: n[2] * W, iy: n[3] * H, ox: n[4] * W, oy: n[5] * H })) })) : [];
+    TR = { open: true, target, tag: tag === 'discuss' ? 'discuss' : 'change', h, size: made.size, W, H, paths, active: null, sel: null,
+      mode: paths.length ? 'edit' : 'draw', undo: [], redo: [], fill: false, dirty: false, g: null, pointers: new Map(), hover: null, s: 1, tx: 0, ty: 0 };
+    if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
+    closeSheet();
+    $('#lastbar').hidden = true; $('#selbar').hidden = true;
+    trEl.hidden = false;
+    trStage.classList.remove('filled');
+    $('#trFill').setAttribute('aria-pressed', 'false');
+    $('#trCancel').textContent = 'Cancel';
+    setTraceMode(TR.mode);
+    requestAnimationFrame(fitTrace);
+  }
+  function closeTrace() {
+    TR = { open: false };
+    trEl.hidden = true;
+    trSvg.innerHTML = '';
+    trCanvas.width = trCanvas.height = 1;
+  }
+  function fitTrace() {
+    if (!TR.open) return;
+    const r = trStage.getBoundingClientRect();
+    TR.s = Math.min(r.width / TR.W, r.height / TR.H) * 0.94;
+    TR.tx = (r.width - TR.W * TR.s) / 2; TR.ty = (r.height - TR.H * TR.s) / 2;
+    applyTraceView();
+  }
+  function applyTraceView() {
+    trCanvas.style.transform = 'translate(' + TR.tx + 'px,' + TR.ty + 'px) scale(' + TR.s + ')';
+    drawTrace();
+  }
+  function setTraceMode(mode) {
+    TR.mode = mode;
+    if (mode === 'edit') TR.active = null;
+    $$('[data-trmode]').forEach(b => b.classList.toggle('on', b.dataset.trmode === mode));
+    drawTrace();
+  }
+  const trPoint = e => { const r = trStage.getBoundingClientRect(); return { x: (e.clientX - r.left - TR.tx) / TR.s, y: (e.clientY - r.top - TR.ty) / TR.s }; };
+  const SX = x => (x * TR.s + TR.tx).toFixed(1), SY = y => (y * TR.s + TR.ty).toFixed(1);
+  function segD(a, b) { return 'C' + SX(a.ox) + ' ' + SY(a.oy) + ' ' + SX(b.ix) + ' ' + SY(b.iy) + ' ' + SX(b.x) + ' ' + SY(b.y); }
+  function drawTrace() {
+    if (!TR.open) return;
+    const out = [];
+    TR.paths.forEach((p, pi) => {
+      if (!p.nodes.length) return;
+      const n = p.nodes;
+      let d = 'M' + SX(n[0].x) + ' ' + SY(n[0].y);
+      for (let i = 1; i < n.length; i++) d += segD(n[i - 1], n[i]);
+      if (p.closed && n.length > 1) d += segD(n[n.length - 1], n[0]) + 'Z';
+      out.push('<path class="tr-path' + (p.closed ? ' closed' : '') + '" fill-rule="evenodd" d="' + d + '"/>');
+    });
+    // The rubber band from the last point to the pointer, while drawing with a mouse.
+    if (TR.mode === 'draw' && TR.active !== null && TR.hover && !TR.g) {
+      const n = TR.paths[TR.active].nodes, a = n[n.length - 1];
+      if (a) out.push('<path class="tr-band" d="M' + SX(a.x) + ' ' + SY(a.y) + 'C' + SX(a.ox) + ' ' + SY(a.oy) + ' ' + SX(TR.hover.x) + ' ' + SY(TR.hover.y) + ' ' + SX(TR.hover.x) + ' ' + SY(TR.hover.y) + '"/>');
+    }
+    if (!trStage.classList.contains('filled')) {
+      const sel = TR.sel && TR.paths[TR.sel.p] && TR.paths[TR.sel.p].nodes[TR.sel.n];
+      if (sel) {
+        const p = TR.paths[TR.sel.p], k = TR.sel.n, len = p.nodes.length;
+        const handles = [[sel, 'i'], [sel, 'o']];
+        const prev = k > 0 ? p.nodes[k - 1] : p.closed ? p.nodes[len - 1] : null, next = k < len - 1 ? p.nodes[k + 1] : p.closed ? p.nodes[0] : null;
+        if (prev && prev !== sel) handles.push([prev, 'o']);
+        if (next && next !== sel) handles.push([next, 'i']);
+        for (const [n, w] of handles) {
+          const hx = n[w + 'x'], hy = n[w + 'y'];
+          if (trDist(hx, hy, n.x, n.y) < 0.01) continue;
+          out.push('<line class="tr-handle-line" x1="' + SX(n.x) + '" y1="' + SY(n.y) + '" x2="' + SX(hx) + '" y2="' + SY(hy) + '"/>' +
+            '<circle class="tr-handle" r="4.5" cx="' + SX(hx) + '" cy="' + SY(hy) + '"/>');
+        }
+      }
+      TR.paths.forEach((p, pi) => p.nodes.forEach((n, ni) => {
+        const isSel = TR.sel && TR.sel.p === pi && TR.sel.n === ni, first = pi === TR.active && ni === 0 && p.nodes.length > 1;
+        out.push('<circle class="tr-node' + (isSel ? ' sel' : '') + (first ? ' first' : '') + '" r="' + (first ? 7 : isSel ? 6 : 4.5) + '" cx="' + SX(n.x) + '" cy="' + SY(n.y) + '"/>');
+      }));
+    }
+    trSvg.innerHTML = out.join('');
+    const sel = TR.sel && TR.paths[TR.sel.p] && TR.paths[TR.sel.p].nodes[TR.sel.n], path = TR.sel ? TR.paths[TR.sel.p] : TR.active !== null ? TR.paths[TR.active] : null;
+    $('#trSmooth').disabled = !sel; $('#trDelete').disabled = !sel;
+    $('#trSmooth').textContent = sel && trSmooth(sel) ? 'Make corner' : 'Make smooth';
+    $('#trClose').disabled = !path || path.nodes.length < 2;
+    $('#trClose').textContent = path && path.closed ? 'Open shape' : 'Close shape';
+    $('#trUndo').disabled = !TR.undo.length; $('#trRedo').disabled = !TR.redo.length;
+    const shapes = TR.paths.filter(p => p.nodes.length > 1).length;
+    $('#trHint').textContent = TR.mode === 'draw'
+      ? (TR.active !== null ? 'Tap for a corner, drag for a curve. Tap the first point to close the shape, or New shape to start another.' : 'Tap to place the first point. Drag as you place a point to make a curve.')
+      : 'Drag points or handles. Tap a curve to add a point. ' + shapes + ' shape' + (shapes === 1 ? '' : 's') + '.';
+  }
+  function trRemember() {
+    TR.undo.push({ paths: trClone(TR.paths), active: TR.active, sel: TR.sel });
+    if (TR.undo.length > 200) TR.undo.shift();
+    TR.redo = [];
+    TR.dirty = true;
+    $('#trCancel').textContent = 'Cancel';
+  }
+  function trRestore(from, to) {
+    const st = from.pop();
+    if (!st) return;
+    to.push({ paths: trClone(TR.paths), active: TR.active, sel: TR.sel });
+    TR.paths = st.paths; TR.active = st.active; TR.sel = st.sel;
+    TR.dirty = true;
+    drawTrace();
+  }
+  function trHitHandle(p, tol) {
+    if (!TR.sel) return null;
+    const path = TR.paths[TR.sel.p], k = TR.sel.n, len = path.nodes.length;
+    const list = [[k, 'i'], [k, 'o']];
+    if (k > 0 || path.closed) list.push([(k - 1 + len) % len, 'o']);
+    if (k < len - 1 || path.closed) list.push([(k + 1) % len, 'i']);
+    for (const [ni, w] of list) {
+      const n = path.nodes[ni];
+      if (trDist(n[w + 'x'], n[w + 'y'], n.x, n.y) < 0.01) continue;
+      if (trDist(p.x, p.y, n[w + 'x'], n[w + 'y']) < tol) return { p: TR.sel.p, n: ni, w };
+    }
+    return null;
+  }
+  function trHitNode(p, tol) {
+    let best = null, bd = tol;
+    TR.paths.forEach((path, pi) => path.nodes.forEach((n, ni) => {
+      const d = trDist(p.x, p.y, n.x, n.y);
+      if (d < bd || (d <= bd && pi === TR.active)) { bd = d; best = { p: pi, n: ni }; }
+    }));
+    return best;
+  }
+  const bez = (a, b, t) => {
+    const u = 1 - t;
+    return { x: u * u * u * a.x + 3 * u * u * t * a.ox + 3 * u * t * t * b.ix + t * t * t * b.x, y: u * u * u * a.y + 3 * u * u * t * a.oy + 3 * u * t * t * b.iy + t * t * t * b.y };
+  };
+  function trHitSegment(p, tol) {
+    let best = null, bd = tol;
+    TR.paths.forEach((path, pi) => {
+      const n = path.nodes, count = path.closed ? n.length : n.length - 1;
+      for (let i = 0; i < count; i++) {
+        const a = n[i], b = n[(i + 1) % n.length];
+        for (let k = 1; k < 48; k++) {
+          const q = bez(a, b, k / 48), d = trDist(p.x, p.y, q.x, q.y);
+          if (d < bd) { bd = d; best = { p: pi, i, t: k / 48 }; }
+        }
+      }
+    });
+    return best;
+  }
+  // Split a curve where it was tapped, keeping its shape (de Casteljau).
+  function trSplit(hit) {
+    const path = TR.paths[hit.p], a = path.nodes[hit.i], b = path.nodes[(hit.i + 1) % path.nodes.length], t = hit.t;
+    const L = (p, q) => ({ x: p.x + (q.x - p.x) * t, y: p.y + (q.y - p.y) * t });
+    if (trDist(a.ox, a.oy, a.x, a.y) < 0.01 && trDist(b.ix, b.iy, b.x, b.y) < 0.01) {
+      const m = L(a, b);
+      path.nodes.splice(hit.i + 1, 0, { x: m.x, y: m.y, ix: m.x, iy: m.y, ox: m.x, oy: m.y });
+      return { p: hit.p, n: hit.i + 1 };
+    }
+    const p0 = { x: a.x, y: a.y }, p1 = { x: a.ox, y: a.oy }, p2 = { x: b.ix, y: b.iy }, p3 = { x: b.x, y: b.y };
+    const q0 = L(p0, p1), q1 = L(p1, p2), q2 = L(p2, p3), r0 = L(q0, q1), r1 = L(q1, q2), m = L(r0, r1);
+    a.ox = q0.x; a.oy = q0.y; b.ix = q2.x; b.iy = q2.y;
+    const n = { x: m.x, y: m.y, ix: r0.x, iy: r0.y, ox: r1.x, oy: r1.y };
+    path.nodes.splice(hit.i + 1, 0, n);
+    if (TR.active === hit.p && hit.i + 1 <= path.nodes.length - 1) { /* still drawing the same shape */ }
+    return { p: hit.p, n: hit.i + 1 };
+  }
+  function trMakeSmooth(path, k) {
+    const n = path.nodes[k], len = path.nodes.length;
+    const prev = k > 0 ? path.nodes[k - 1] : path.closed ? path.nodes[len - 1] : null;
+    const next = k < len - 1 ? path.nodes[k + 1] : path.closed ? path.nodes[0] : null;
+    let dx = (next || n).x - (prev || n).x, dy = (next || n).y - (prev || n).y;
+    const d = Math.hypot(dx, dy) || 1; dx /= d; dy /= d;
+    const l1 = prev ? trDist(prev.x, prev.y, n.x, n.y) / 3 : 30 / TR.s, l2 = next ? trDist(next.x, next.y, n.x, n.y) / 3 : 30 / TR.s;
+    n.ix = n.x - dx * l1; n.iy = n.y - dy * l1; n.ox = n.x + dx * l2; n.oy = n.y + dy * l2;
+  }
+  function trDeletePoint() {
+    if (!TR.sel) return;
+    trRemember();
+    const path = TR.paths[TR.sel.p];
+    path.nodes.splice(TR.sel.n, 1);
+    if (path.closed && path.nodes.length < 3) path.closed = false;
+    if (!path.nodes.length) {
+      TR.paths.splice(TR.sel.p, 1);
+      if (TR.active === TR.sel.p) TR.active = null;
+      else if (TR.active !== null && TR.active > TR.sel.p) TR.active--;
+      TR.sel = null;
+    } else TR.sel = { p: TR.sel.p, n: Math.min(TR.sel.n, path.nodes.length - 1) };
+    drawTrace();
+  }
+  function trFinishShape() {
+    if (TR.active !== null && TR.paths[TR.active].nodes.length < 2) {
+      TR.paths.splice(TR.active, 1);
+      TR.sel = null;
+    }
+    TR.active = null;
+    drawTrace();
+  }
+  const trTol = e => (e.pointerType === 'touch' ? 22 : 13) / TR.s;
+  trStage.addEventListener('pointerdown', e => {
+    if (!TR.open) return;
+    e.preventDefault();
+    try { trStage.setPointerCapture(e.pointerId); } catch (err) { /* synthetic events */ }
+    TR.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY, type: e.pointerType });
+    const touches = [...TR.pointers.values()].filter(q => q.type === 'touch');
+    if (touches.length >= 2) {                         // two fingers: pan and zoom
+      const [a, b] = touches;
+      TR.g = { type: 'pinch', d0: trDist(a.x, a.y, b.x, b.y), cx: (a.x + b.x) / 2, cy: (a.y + b.y) / 2, s0: TR.s, tx0: TR.tx, ty0: TR.ty };
+      return;
+    }
+    if (e.pointerType === 'touch' || e.button === 1 || TR.space) {
+      TR.g = { type: 'pan', id: e.pointerId, x: e.clientX, y: e.clientY, tx0: TR.tx, ty0: TR.ty };
+      return;
+    }
+    if (e.button > 0) return;
+    const p = trPoint(e), tol = trTol(e), before = { paths: trClone(TR.paths), active: TR.active, sel: TR.sel };
+    const handle = trHitHandle(p, tol);
+    if (handle) {
+      const n = TR.paths[handle.p].nodes[handle.n];
+      TR.g = { type: 'handle', id: e.pointerId, ...handle, smooth: trSmooth(n), before };
+      return;
+    }
+    const node = trHitNode(p, tol);
+    if (node) {
+      const path = TR.paths[node.p];
+      if (TR.mode === 'draw' && TR.active === node.p && node.n === 0 && path.nodes.length >= 2 && !path.closed) {
+        trRemember();
+        path.closed = true;
+        TR.active = null;
+        TR.sel = node;
+        TR.g = { type: 'pull', id: e.pointerId, ...node, x0: e.clientX, y0: e.clientY };
+        drawTrace();
+        return;
+      }
+      if (TR.mode === 'draw' && !path.closed && node.p !== TR.active && (node.n === 0 || node.n === path.nodes.length - 1)) {
+        if (node.n === 0) path.nodes.reverse().forEach(n => { [n.ix, n.ox] = [n.ox, n.ix]; [n.iy, n.oy] = [n.oy, n.iy]; });
+        TR.active = node.p;
+        TR.sel = { p: node.p, n: path.nodes.length - 1 };
+      } else TR.sel = node;
+      const n = path.nodes[TR.sel.n];
+      TR.g = { type: 'node', id: e.pointerId, p: TR.sel.p, n: TR.sel.n, start: p, orig: Object.assign({}, n), before };
+      drawTrace();
+      return;
+    }
+    const seg = trHitSegment(p, tol);
+    if (seg) {
+      trRemember();
+      TR.sel = trSplit(seg);
+      const n = TR.paths[TR.sel.p].nodes[TR.sel.n];
+      TR.g = { type: 'node', id: e.pointerId, p: TR.sel.p, n: TR.sel.n, start: p, orig: Object.assign({}, n), moved: true };
+      drawTrace();
+      return;
+    }
+    if (TR.mode === 'draw') {
+      trRemember();
+      if (TR.active === null) { TR.paths.push({ closed: false, nodes: [] }); TR.active = TR.paths.length - 1; }
+      const nodes = TR.paths[TR.active].nodes;
+      nodes.push({ x: p.x, y: p.y, ix: p.x, iy: p.y, ox: p.x, oy: p.y });
+      TR.sel = { p: TR.active, n: nodes.length - 1 };
+      TR.g = { type: 'pull', id: e.pointerId, p: TR.active, n: nodes.length - 1, x0: e.clientX, y0: e.clientY };
+      drawTrace();
+      return;
+    }
+    TR.sel = null;
+    TR.g = { type: 'pan', id: e.pointerId, x: e.clientX, y: e.clientY, tx0: TR.tx, ty0: TR.ty };
+    drawTrace();
+  });
+  trStage.addEventListener('pointermove', e => {
+    if (!TR.open) return;
+    if (TR.pointers.has(e.pointerId)) TR.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY, type: e.pointerType });
+    const g = TR.g;
+    if (!g) {
+      if (e.pointerType === 'mouse' && TR.mode === 'draw' && TR.active !== null) { TR.hover = trPoint(e); drawTrace(); }
+      return;
+    }
+    e.preventDefault();
+    if (g.type === 'pinch') {
+      const t = [...TR.pointers.values()].filter(q => q.type === 'touch');
+      if (t.length < 2) return;
+      const [a, b] = t, r = trStage.getBoundingClientRect();
+      const s = Math.max(0.05, Math.min(40, g.s0 * trDist(a.x, a.y, b.x, b.y) / (g.d0 || 1)));
+      const cx = (a.x + b.x) / 2, cy = (a.y + b.y) / 2;
+      const ix = (g.cx - r.left - g.tx0) / g.s0, iy = (g.cy - r.top - g.ty0) / g.s0;
+      TR.s = s; TR.tx = cx - r.left - ix * s; TR.ty = cy - r.top - iy * s;
+      applyTraceView();
+      return;
+    }
+    if (e.pointerId !== g.id) return;
+    if (g.type === 'pan') { TR.tx = g.tx0 + e.clientX - g.x; TR.ty = g.ty0 + e.clientY - g.y; applyTraceView(); return; }
+    const p = trPoint(e), path = TR.paths[g.p], n = path && path.nodes[g.n];
+    if (!n) return;
+    if (g.type === 'node') {
+      if (!g.moved && g.before && trDist(p.x, p.y, g.start.x, g.start.y) * TR.s < 3) return;
+      if (!g.moved) { if (g.before) { TR.undo.push(g.before); TR.redo = []; TR.dirty = true; } g.moved = true; }
+      const dx = p.x - g.start.x, dy = p.y - g.start.y, o = g.orig;
+      Object.assign(n, { x: o.x + dx, y: o.y + dy, ix: o.ix + dx, iy: o.iy + dy, ox: o.ox + dx, oy: o.oy + dy });
+    } else if (g.type === 'handle') {
+      if (!g.moved) { TR.undo.push(g.before); TR.redo = []; TR.dirty = true; g.moved = true; }
+      const w = g.w, other = w === 'i' ? 'o' : 'i';
+      n[w + 'x'] = p.x; n[w + 'y'] = p.y;
+      if (g.smooth) {                                  // a smooth point keeps its two handles in line
+        const len = trDist(n[other + 'x'], n[other + 'y'], n.x, n.y), d = trDist(p.x, p.y, n.x, n.y) || 1;
+        n[other + 'x'] = n.x - (p.x - n.x) / d * len; n[other + 'y'] = n.y - (p.y - n.y) / d * len;
+      }
+    } else if (g.type === 'pull') {
+      if (Math.hypot(e.clientX - g.x0, e.clientY - g.y0) < 4) return;
+      n.ox = p.x; n.oy = p.y; n.ix = 2 * n.x - p.x; n.iy = 2 * n.y - p.y;
+    }
+    drawTrace();
+  });
+  const trEnd = e => {
+    if (!TR.open) return;
+    TR.pointers.delete(e.pointerId);
+    const g = TR.g;
+    if (g && (g.type === 'pinch' ? [...TR.pointers.values()].filter(q => q.type === 'touch').length < 2 : e.pointerId === g.id)) TR.g = null;
+    drawTrace();
+  };
+  trStage.addEventListener('pointerup', trEnd);
+  trStage.addEventListener('pointercancel', trEnd);
+  trStage.addEventListener('pointerleave', () => { if (TR.open && TR.hover) { TR.hover = null; drawTrace(); } });
+  trStage.addEventListener('dblclick', e => { if (TR.open && TR.mode === 'draw') { e.preventDefault(); trFinishShape(); } });
+  trStage.addEventListener('wheel', e => {
+    if (!TR.open) return;
+    e.preventDefault();
+    if (e.ctrlKey || e.metaKey) {                      // a trackpad pinch, or Ctrl-scroll: zoom at the pointer
+      const r = trStage.getBoundingClientRect(), ix = (e.clientX - r.left - TR.tx) / TR.s, iy = (e.clientY - r.top - TR.ty) / TR.s;
+      TR.s = Math.max(0.05, Math.min(40, TR.s * Math.exp(-e.deltaY * 0.01)));
+      TR.tx = e.clientX - r.left - ix * TR.s; TR.ty = e.clientY - r.top - iy * TR.s;
+    } else { TR.tx -= e.deltaX; TR.ty -= e.deltaY; }
+    applyTraceView();
+  }, { passive: false });
+  $$('[data-trmode]').forEach(b => b.addEventListener('click', () => setTraceMode(b.dataset.trmode)));
+  $('#trSmooth').addEventListener('click', () => {
+    if (!TR.sel) return;
+    trRemember();
+    const path = TR.paths[TR.sel.p], n = path.nodes[TR.sel.n];
+    if (trSmooth(n)) { n.ix = n.ox = n.x; n.iy = n.oy = n.y; } else trMakeSmooth(path, TR.sel.n);
+    drawTrace();
+  });
+  $('#trDelete').addEventListener('click', trDeletePoint);
+  $('#trClose').addEventListener('click', () => {
+    const k = TR.sel ? TR.sel.p : TR.active;
+    if (k === null || k === undefined || !TR.paths[k] || TR.paths[k].nodes.length < 2) return;
+    trRemember();
+    TR.paths[k].closed = !TR.paths[k].closed;
+    if (TR.paths[k].closed && TR.active === k) TR.active = null;
+    drawTrace();
+  });
+  $('#trNew').addEventListener('click', () => { trFinishShape(); TR.sel = null; setTraceMode('draw'); });
+  $('#trUndo').addEventListener('click', () => trRestore(TR.undo, TR.redo));
+  $('#trRedo').addEventListener('click', () => trRestore(TR.redo, TR.undo));
+  $('#trFit').addEventListener('click', fitTrace);
+  $('#trFill').addEventListener('click', () => {
+    const on = !trStage.classList.contains('filled');
+    trStage.classList.toggle('filled', on);
+    $('#trFill').setAttribute('aria-pressed', String(on));
+    $('#trFill').classList.toggle('on', on);
+    drawTrace();
+  });
+  $('#trCancel').addEventListener('click', () => {
+    if (TR.dirty && $('#trCancel').textContent !== 'Tap again to discard') { $('#trCancel').textContent = 'Tap again to discard'; return; }
+    closeTrace();
+  });
+  $('#trDone').addEventListener('click', () => {
+    trFinishShape();
+    const W = TR.W, H = TR.H;
+    const paths = TR.paths.filter(p => p.nodes.length >= 2).map(p => ({ closed: p.closed, nodes: p.nodes.map(n => [n.x / W, n.y / H, n.ix / W, n.iy / H, n.ox / W, n.oy / H]
+      .map((v, i) => Math.round(Math.max(i < 2 ? 0 : -1, Math.min(i < 2 ? 1 : 2, v)) * 1e6) / 1e6)) }));
+    if (!paths.length) { toast('Draw a shape with at least two points first'); return; }
+    const xs = paths.flatMap(p => p.nodes.flatMap(n => [n[0], n[2], n[4]])), ys = paths.flatMap(p => p.nodes.flatMap(n => [n[1], n[3], n[5]]));
+    const region = Object.assign({ shape: 'vector', paths, size: TR.size.map(v => Math.round(v * 100) / 100) }, enclosing(xs, ys),
+      TR.target.image ? { image: TR.target.image } : { page: TR.target.page });
+    const crop = { source: trCanvas }, h = TR.h, tag = TR.tag;
+    if (h) {
+      const before = JSON.parse(JSON.stringify(h.region));
+      h.region = region;
+      try { S.regionImages.set(h.id, regionCrop(region, trCanvas)); region.snapshot = h.id + '.png'; } catch (e) { /* the shapes are still saved */ }
+      h.updated_at = isoLocal();
+      closeTrace();
+      redrawAll(); scheduleSave();
+      showBar('#' + h.n + ' tracing updated', { type: 'edit', id: h.id, before }, true);
+    } else {
+      closeTrace();
+      addRegion(region, tag, crop);
+    }
+  });
+  document.addEventListener('keydown', e => {
+    if (!TR.open) return;
+    e.stopPropagation();
+    const k = e.key, mod = e.metaKey || e.ctrlKey;
+    if (k === ' ') { TR.space = true; e.preventDefault(); return; }
+    if (mod && k.toLowerCase() === 'z') { e.preventDefault(); if (e.shiftKey) trRestore(TR.redo, TR.undo); else trRestore(TR.undo, TR.redo); return; }
+    if (k === 'Escape') { e.preventDefault(); if (TR.active !== null) trFinishShape(); else if (TR.sel) { TR.sel = null; drawTrace(); } else $('#trCancel').click(); return; }
+    if (k === 'Enter') { e.preventDefault(); trFinishShape(); return; }
+    if (k === 'Backspace' || k === 'Delete') { e.preventDefault(); trDeletePoint(); return; }
+    if (!mod && (k === 'p' || k === 'P')) setTraceMode('draw');
+    if (!mod && (k === 'v' || k === 'V' || k === 'a' || k === 'A')) setTraceMode('edit');
+  }, true);
+  document.addEventListener('keyup', e => { if (TR.open && e.key === ' ') TR.space = false; }, true);
+  window.addEventListener('resize', () => { if (TR.open) drawTrace(); });
+  // Where a mark's figure is now, to edit its tracing from the panel.
+  function targetFor(region) {
+    if (region.image) {
+      const fig = $$('.cm-figure').find(f => f.dataset.ref === region.image && f.offsetParent !== null);
+      return fig && regionTarget($('.figure-surface', fig) || fig);
+    }
+    const P = S.pages[region.page - 1];
+    return P && regionTarget(P.div);
+  }
+  $('#sheetTrace').addEventListener('click', () => {
+    const h = S.hl.find(x => x.n === S.openN);
+    if (h && h.region) openTrace(targetFor(h.region), h.tag, h);
+  });
+
   function highlightPayload() {
     const images = {};
     for (const h of S.hl) if (h.region && S.regionImages.has(h.id)) images[h.id] = S.regionImages.get(h.id);
@@ -2208,7 +2839,7 @@
   $('#lastNote').addEventListener('click', () => {
     const a = lastAction;
     $('#lastbar').hidden = true;
-    const h = a && a.type === 'add' && S.hl.find(x => x.id === a.id);
+    const h = a && (a.type === 'add' || a.type === 'edit') && S.hl.find(x => x.id === a.id);
     if (h) openSheet(h.n, true);
   });
   $('#lastUndo').addEventListener('click', () => {
@@ -2224,6 +2855,14 @@
     } else if (a.type === 'delete') {
       S.deleted.delete(a.h.id); S.hl.push(a.h); S.hl.sort((x, y) => x.n - y.n);
       toast('Restored #' + a.h.n);
+    } else if (a.type === 'edit') {                 // a tracing as it was before it was edited
+      const h = S.hl.find(x => x.id === a.id);
+      if (!h || !a.before) return;
+      h.region = a.before;
+      const t = targetFor(h.region);
+      try { if (t && t.source) S.regionImages.set(h.id, regionCrop(h.region, t.source)); } catch (e) { /* the shapes are still restored */ }
+      h.updated_at = isoLocal();
+      toast('Tracing #' + h.n + ' restored');
     }
     redrawAll(); scheduleSave();
   });
@@ -2384,7 +3023,7 @@
     S.tool = tool;
     $$('[data-tool]').forEach(b => b.classList.toggle('on', b.dataset.tool === tool));
     pagesEl.classList.toggle('drawing', tool !== 'select');
-    if (tool === 'select') setBox(false);
+    if (tool === 'select') setShape(null);
     if (tool !== 'select') { const sel = window.getSelection(); if (sel) sel.removeAllRanges(); $('#selbar').hidden = true; }
   }
   $('#finger').addEventListener('change', e => {
@@ -2394,6 +3033,8 @@
 
   // ------------------------------------------------------------ editing one highlight
 
+  const regionLabel = r => r.shape === 'vector' ? 'Vector tracing (' + r.paths.length + ' shape' + (r.paths.length === 1 ? '' : 's') + ')'
+    : r.shape === 'blob' ? 'Outlined figure area' : 'Marked figure area';
   function openSheet(n, focusNote) {
     const h = S.hl.find(x => x.n === n);
     if (!h) return;
@@ -2403,7 +3044,8 @@
     $('#sheetNum').textContent = '#' + h.n;
     $('#sheetPage').textContent = placeOf(h);
     const q = $('#sheetQuote');
-    q.textContent = h.region ? 'Marked figure area' : h.text; q.className = h.tag;
+    q.textContent = h.region ? regionLabel(h.region) : h.text; q.className = h.tag;
+    $('#sheetTrace').hidden = !(h.region && h.region.shape === 'vector') || !!S.reopen;
     const picture = $('#sheetRegion');
     picture.hidden = !h.region || !h.region.snapshot;
     if (!picture.hidden) picture.src = regionSnapshot(h);
@@ -2598,7 +3240,7 @@
   $('#lastRec').addEventListener('click', () => {
     const a = lastAction;
     $('#lastbar').hidden = true;
-    const h = a && a.type === 'add' && S.hl.find(x => x.id === a.id);
+    const h = a && (a.type === 'add' || a.type === 'edit') && S.hl.find(x => x.id === a.id);
     if (h) { openSheet(h.n); startRecording(h); }
   });
 
@@ -2640,7 +3282,7 @@
       '<span class="muted">' + counts.change + ' change, ' + counts.discuss + ' discuss</span>' +
       '<button id="listClose">Close</button></div>' +
       (items.length ? items.map(h => '<div class="li" data-n="' + h.n + '"><span class="badge ' + h.tag + (h.note ? ' noted' : '') + (h.audio && h.audio.length ? ' voiced' : '') + '">' + h.n + '</span><div>' +
-        '<div class="li-text">' + (h.region ? 'Marked figure area' : esc(h.text.length > 220 ? h.text.slice(0, 220) + '…' : h.text)) + '</div>' +
+        '<div class="li-text">' + (h.region ? regionLabel(h.region) : esc(h.text.length > 220 ? h.text.slice(0, 220) + '…' : h.text)) + '</div>' +
         (h.note ? '<div class="li-note">' + esc(h.note) + '</div>' : '') +
         (h.audio || []).map((c, k) => '<div class="li-voice">Voice note ' + (k + 1) + ' (' + clockStr(c.seconds) + '): ' + clipStatus(c.file) + '</div>').join('') +
         '<div class="li-meta">' + esc(placeOf(h)) + ' &middot; ' + h.tag + '</div></div></div>').join('')
@@ -2781,7 +3423,7 @@
   });
 
   // test hook for automated checks
-  window.__review = { S, T, PV, TX, blockWords, pointAt, sourceBetween, boundaryAt, rangeBetween, addFromRange, rangeText, rangeParts, save, flush };
+  window.__review = { get TR() { return TR; }, S, T, PV, TX, blockWords, pointAt, sourceBetween, boundaryAt, rangeBetween, addFromRange, rangeText, rangeParts, save, flush };
 
   route();
 })();

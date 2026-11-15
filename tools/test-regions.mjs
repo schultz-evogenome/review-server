@@ -98,6 +98,12 @@ try {
     return { page: await js(`({hash:location.hash,title:document.title,status:document.querySelector('#status')?.textContent,done:document.querySelector('#doneBtn')?.textContent,boxes:document.querySelectorAll('.region-box').length,events:window.figureEvents})`), errors };
   };
   const click = sel => js(`document.querySelector(${JSON.stringify(sel)}).click()`);
+  // Page.reload returns before the old page is gone: wait for the new one, so no check passes on the old page.
+  const reload = async () => {
+    await js('window.__beforeReload = true');
+    await cdp('Page.reload');
+    await until(() => js('!window.__beforeReload && document.readyState === "complete"'), 'reload');
+  };
   const detail = async id => (await fetch(config.base + '/api/items/' + id)).json();
   const count = async (id, n) => until(async () => { const d = await detail(id); return d.highlights.highlights.length === n && d; }, n + ' saved marks');
   async function rect(sel) {
@@ -126,7 +132,7 @@ try {
   await cdp('Emulation.setDeviceMetricsOverride', { width: 1100, height: 1000, deviceScaleFactor: 1, mobile: false });
   await cdp('Page.navigate', { url: config.base + '/#/item/' + config.pdf });
   await until(() => js(`!!document.querySelector('.textLayer span')`), 'PDF render');
-  await click('#tools [data-box]');
+  await click('#tools [data-shape="box"]');
   await drag('.page', [.2, .3], [.6, .55], 'pen');
   let data = await count(config.pdf, 1), mark = data.highlights.highlights[0];
   assert.equal(mark.text, '');
@@ -143,7 +149,7 @@ try {
   await until(async () => (await detail(config.pdf)).highlights.highlights[0].audio.length === 1, 'recording saved on figure');
   await click('#sheetClose');
   await until(async () => (await detail(config.pdf)).highlights.highlights[0].note === 'Make this panel larger', 'figure note');
-  await cdp('Page.reload');
+  await reload();
   await until(() => js(`!!document.querySelector('.page .region-box')`), 'box survives reload');
   await cdp('Emulation.setDeviceMetricsOverride', { width: 800, height: 900, deviceScaleFactor: 2, mobile: false });
   await until(() => js(`document.querySelector('.page')?.clientWidth < 800 && !!document.querySelector('.region-box')`), 'resized PDF');
@@ -160,7 +166,7 @@ try {
   await until(() => js(`!document.querySelector('#queue').hidden && location.hash === '#/'`), 'return to queue');
   await js(`location.hash='#/item/${config.pdf}'`);
   await until(() => js(`document.querySelector('#doneBtn').textContent === 'Reopen' && !!document.querySelector('.page .region-box')`), 'reopen view');
-  await click('#tools [data-box]');
+  await click('#tools [data-shape="box"]');
   await drag('.page', [.65, .25], [.85, .4]);
   assert.equal((await detail(config.pdf)).highlights.highlights.length, 1, 'finished review is read-only');
   await click('#doneBtn');
@@ -219,7 +225,7 @@ try {
   await drag('#editor .cm-figure[data-ref="plot.pdf"] .figure-surface', [.2, .3], [.5, .55]);
   data = await count(config.text, 3);
   assert.equal(data.highlights.highlights[2].region.image, 'plot.pdf');
-  await cdp('Page.reload');
+  await reload();
   await until(() => js(`document.querySelectorAll('#editor .region-box').length === 3`), 'all image marks survive reload');
   data = await detail(config.text);
   assert.equal(data.highlights.highlights[0].note, 'Change the blue part');
