@@ -47,7 +47,10 @@ why in the app and you will see that message next time: fix the cause and offer 
 
 - Never delete, move, or rename anything in a review item's folder (PDFs, highlights.json, done.json,
   audio, edited copies), and never read the documents under review: they are private.
-- Never add names, hostnames, home paths, or anything private to the repository. It is public.
+- Never add names, hostnames, home paths, or anything private to the repository, a commit message, or
+  an author line. It is public. In particular, never write this computer's name (`hostname` shows it)
+  or the name of the folder above the live checkout: describe it as "the server". The script refuses to
+  put live any commit that contains them.
 - Never weaken the checks that stop other websites from changing the queue, or the token checks.
 - Never remove or change how existing highlights, voice notes, or edits are stored, so nothing the
   reviewer has already marked is lost.

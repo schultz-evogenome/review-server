@@ -2942,7 +2942,7 @@
 
   // ------------------------------------------------------------ zooming the PDF, not the page
   // Pinching (or a trackpad pinch / ctrl+scroll on a laptop) zooms only the pages; the bar at the top and the
-  // highlight sheet at the bottom keep their size (Darrin, 14 November 2026). While the fingers move, the pages are
+  // highlight sheet at the bottom keep their size. While the fingers move, the pages are
   // scaled with CSS; when they lift, the pages are drawn again, sharp, at the new size, with the point that was under
   // the fingers kept in place.
   S.zoom = 1;

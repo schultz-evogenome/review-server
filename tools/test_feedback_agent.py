@@ -83,7 +83,8 @@ class FeedbackAgent(unittest.TestCase):
         self.log = self.tmp / 'claude-calls.jsonl'
         os.environ.update(FAKE_LOG=str(self.log), FAKE_SERVER=self.base, FAKE_STATE=str(self.state))
         self.args = ['--work', str(self.tmp / 'work'), '--live', str(self.live), '--server', self.base, '--state', str(self.state),
-                     '--claude', str(fake), '--push-key', 'unused', '--push-url', str(self.github), '--interval', '1']
+                     '--claude', str(fake), '--push-key', 'unused', '--push-url', str(self.github), '--interval', '1',
+                     '--git-name', 'agent', '--git-email', 'agent@example.org']
 
     def tearDown(self):
         self.server.shutdown()
@@ -123,6 +124,7 @@ class FeedbackAgent(unittest.TestCase):
         self.assertEqual(fa.main(self.args + ['--once']), 0)
         self.assertEqual(git('rev-parse', 'HEAD', cwd=self.live), offer['deploy'])
         self.assertEqual(git('rev-parse', 'main', cwd=self.github), offer['deploy'])
+        self.assertEqual(git('config', 'user.email', cwd=self.tmp / 'work' / 'repo'), 'agent@example.org')
         self.assertIn('is live', self.messages()[-1]['text'])
         self.assertIn('on GitHub too', self.messages()[-1]['text'])
         # The second run resumed Claude's session; a plain note gets a reply even when Claude does not post one.
@@ -131,6 +133,18 @@ class FeedbackAgent(unittest.TestCase):
         calls = [json.loads(line) for line in self.log.read_text().splitlines()]
         self.assertIn('--resume', calls[-1])
         self.assertTrue(self.messages()[-1]['text'].startswith('Noted: - The reviewer wrote'), self.messages()[-1]['text'])
+
+    def test_a_commit_with_a_private_word_is_not_put_live(self):
+        fa = self.agent()
+        self.post('/api/feedback', {'text': 'Put the title in bold, please.'})
+        fa.main(self.args + ['--once', '--forbid', 'bold'])           # the stand-in's commit message says "Bold title"
+        offer = self.messages()[-1]
+        before = git('rev-parse', 'HEAD', cwd=self.live)
+        self.post('/api/feedback/%s/answer' % offer['id'], {'choice': 'Put it live'})
+        fa.main(self.args + ['--once', '--forbid', 'bold'])
+        self.assertEqual(git('rev-parse', 'HEAD', cwd=self.live), before)
+        self.assertEqual(git('rev-parse', 'main', cwd=self.github), before)
+        self.assertIn('would publish "bold"', self.messages()[-1]['text'])
 
     def test_an_offer_older_than_the_live_app_is_not_put_live(self):
         fa = self.agent()

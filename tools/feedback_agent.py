@@ -18,6 +18,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -98,12 +99,16 @@ class Agent:
         return r
 
     def ensure_clone(self):
-        if (self.repo / '.git').is_dir():
-            return
-        self.work.mkdir(parents=True, exist_ok=True)
-        url = self.run(['git', '-C', str(self.live), 'remote', 'get-url', 'origin']).stdout.strip()
-        self.run(['git', 'clone', '-q', url, str(self.repo)], timeout=900)
-        log('cloned', url, 'into', self.repo)
+        if not (self.repo / '.git').is_dir():
+            self.work.mkdir(parents=True, exist_ok=True)
+            url = self.run(['git', '-C', str(self.live), 'remote', 'get-url', 'origin']).stdout.strip()
+            self.run(['git', 'clone', '-q', url, str(self.repo)], timeout=900)
+            log('cloned', url, 'into', self.repo)
+        # Commits made here name this author, in this clone only; otherwise git would make one up from the
+        # computer's name, which must not be published.
+        for key, value in (('user.name', self.a.git_name), ('user.email', self.a.git_email)):
+            if value:
+                self.run(['git', 'config', key, value], cwd=self.repo)
 
     # ------------------------------------------------------------ the loop
 
@@ -184,6 +189,16 @@ class Agent:
 
     # ------------------------------------------------------------ putting a commit live
 
+    def private_words(self, base, commit):
+        """Words that must never reach the public repository (this computer's name, the home folder, and any
+        given with --forbid) found in the changes or commit messages since base."""
+        words = {w.lower() for w in self.a.forbid if w}
+        words.add(socket.gethostname().split('.')[0].lower())
+        words.add(str(Path.home()).lower())
+        text = (self.run(['git', 'log', '--format=%an %ae %cn %ce %B', base + '..' + commit], cwd=self.repo).stdout + '\n' +
+                self.run(['git', 'diff', base, commit], cwd=self.repo).stdout).lower()
+        return sorted(w for w in words if len(w) > 2 and w in text)
+
     def server_quiet(self):
         """No highlight, text, or voice note was saved in the last minute."""
         if not self.a.service:
@@ -205,6 +220,11 @@ class Agent:
                 return
             if self.run(['git', 'status', '--porcelain'], cwd=self.live).stdout.strip():
                 self.say('I did not put %s live: the live checkout has changes nobody committed.' % full[:7])
+                return
+            found = self.private_words(live_head, full)
+            if found:
+                self.say('I did not put %s live: it would publish %s in the repository, which is public. I will take that out '
+                         'and offer it again.' % (full[:7], ' and '.join('"%s"' % w for w in found)))
                 return
             # Test exactly this commit, in a scratch checkout of the agent's clone.
             scratch = self.work / 'deploy-check'
@@ -292,6 +312,10 @@ def main(argv=None):
     ap.add_argument('--path', default='', help='folders to put first on PATH for Claude (for example a newer node)')
     ap.add_argument('--push-key', default='', help='an SSH key that may push to the repository (a deploy key)')
     ap.add_argument('--push-url', default='', help='where to push, for example git@github.com:owner/repo.git')
+    ap.add_argument('--forbid', action='append', default=[], help='a word that must never be published (repeat for more); '
+                    'this computer\'s name and the home folder are always refused')
+    ap.add_argument('--git-name', default='', help='the author of the agent\'s commits (set in its clone only)')
+    ap.add_argument('--git-email', default='', help='the author\'s email, for example a GitHub no-reply address')
     ap.add_argument('--once', action='store_true', help='look once and stop (for testing)')
     a = ap.parse_args(argv)
     agent = Agent(a)
